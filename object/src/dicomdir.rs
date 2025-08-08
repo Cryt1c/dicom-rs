@@ -8,6 +8,16 @@ pub struct DicomDir {
     file: FileDicomObject<InMemDicomObject>,
 }
 
+// DirectoryRecord {
+// directory_record_type,
+// referenced_file_id,
+// referenced_sop_class_uid_in_file,
+// referenced_sop_instance_uid_in_file,
+// referenced_transfer_syntax_uid_in_file,
+// referenced_transfer_syntax_uid_in_file,
+// referenced_related_general_sop_class_uid_in_file,
+// }
+
 pub type Result<T, E = ReadError> = std::result::Result<T, E>;
 
 impl DicomDir {
@@ -23,9 +33,19 @@ impl DicomDir {
             file: default_dicom_object,
         })
     }
+    pub fn get_directory_record_sequence(&self) -> Vec<InMemDicomObject> {
+        let directory_record_sequence = self
+            .file
+            .element(tags::DIRECTORY_RECORD_SEQUENCE)
+            .expect("could not get DIRECTORY_RECORD_SEQUENCE")
+            .items()
+            .expect("could not get items of DIRECTORY_RECORD_SEQUENCE");
+        directory_record_sequence.to_vec()
+    }
 
     pub fn get_referenced_file_ids(&self) -> Vec<String> {
-        let directory_record_sequence = self.file
+        let directory_record_sequence = self
+            .file
             .element(tags::DIRECTORY_RECORD_SEQUENCE)
             .expect("could not get DIRECTORY_RECORD_SEQUENCE")
             .items()
@@ -41,6 +61,15 @@ impl DicomDir {
             })
             .collect();
         referenced_file_ids
+    }
+
+    pub fn len(&self) -> usize {
+        self.file
+            .element(tags::DIRECTORY_RECORD_SEQUENCE)
+            .expect("could not get DIRECTORY_RECORD_SEQUENCE")
+            .items()
+            .expect("could not get items of DIRECTORY_RECORD_SEQUENCE")
+            .len()
     }
 }
 
@@ -60,10 +89,16 @@ mod test {
             return;
         };
 
-        println!("Referenced File IDs:");
-        let referenced_file_ids = dicom_dir.get_referenced_file_ids();
-        for file_id in &referenced_file_ids {
-            println!("  {}", file_id);
+        // println!("Referenced File IDs:");
+        // let referenced_file_ids = dicom_dir.get_referenced_file_ids();
+        // for file_id in &referenced_file_ids {
+        //     println!("  {}", file_id);
+        // }
+        let directory_record_sequence = dicom_dir.get_directory_record_sequence();
+        for directory_record in &directory_record_sequence {
+            println!("  {:?}", directory_record);
         }
+
+        println!("dicom_dir.len() {:?}", dicom_dir.len());
     }
 }

@@ -95,9 +95,9 @@ mod test {
         //     println!("  {}", file_id);
         // }
         let directory_record_sequence = dicom_dir.get_directory_record_sequence();
-        for directory_record in &directory_record_sequence {
-            println!("  {:?}", directory_record);
-        }
+        // for directory_record in &directory_record_sequence {
+        //     println!("  {:?}", directory_record);
+        // }
 
         println!("dicom_dir.len() {:?}", dicom_dir.len());
     }

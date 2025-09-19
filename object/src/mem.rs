@@ -710,16 +710,19 @@ where
                         uid,
                         name: ts.name(),
                         feature_name: "dicom-transfer-syntax-registry/deflate",
-                    }.fail();
+                    }
+                    .fail();
                 }
 
                 ReadUnsupportedTransferSyntaxSnafu {
                     uid,
                     name: ts.name(),
-                }.fail()
+                }
+                .fail()
             }
             Codec::None | Codec::EncapsulatedPixelData(..) => {
-                let mut dataset = DataSetReader::new_with_ts_cs(from, ts, cs).context(CreateParserSnafu)?;
+                let mut dataset =
+                    DataSetReader::new_with_ts_cs(from, ts, cs).context(CreateParserSnafu)?;
                 InMemDicomObject::build_object(&mut dataset, dict, false, Length::UNDEFINED, None)
             }
         }
@@ -1844,7 +1847,8 @@ where
         if let Codec::Dataset(Some(adapter)) = ts.codec() {
             let adapter = adapter.adapt_writer(Box::new(to));
             // prepare data set writer
-            let mut dset_writer = DataSetWriter::with_ts(adapter, ts).context(CreatePrinterSnafu)?;
+            let mut dset_writer =
+                DataSetWriter::with_ts(adapter, ts).context(CreatePrinterSnafu)?;
 
             // write object
             dset_writer
@@ -1854,7 +1858,8 @@ where
             Ok(())
         } else {
             // prepare data set writer
-            let mut dset_writer = DataSetWriter::with_ts_cs(to, ts, cs).context(CreatePrinterSnafu)?;
+            let mut dset_writer =
+                DataSetWriter::with_ts_cs(to, ts, cs).context(CreatePrinterSnafu)?;
 
             // write object
             dset_writer
@@ -2026,6 +2031,29 @@ where
                 }
                 token => return UnexpectedTokenSnafu { token }.fail(),
             };
+
+            // if tags::DIRECTORY_RECORD_SEQUENCE == elem.tag() {
+            //     println!("asdf tag {:?}", elem.tag());
+            // }
+                println!("asdf tag {:?}", elem.tag());
+            if let Ok(value) = elem.uint32() {
+                if value == 396 {
+                    println!("asdf tag {:?}", elem.tag());
+                    println!("asdf {:?}", value);
+                }
+            }
+            if let Ok(value) = elem.uint32() {
+                if value == 52 {
+                    println!("asdf tag {:?}", elem.tag());
+                    println!("asdf {:?}", value);
+                }
+            }
+            if let Ok(value) = elem.uint32() {
+                if value == 3126 {
+                    println!("asdf tag {:?}", elem.tag());
+                    println!("asdf {:?}", value);
+                }
+            }
             entries.insert(elem.tag(), elem);
         }
 
@@ -2524,8 +2552,7 @@ mod tests {
         let meta = file_object.meta();
 
         assert_eq!(
-            meta.media_storage_sop_instance_uid
-                .trim_end_matches('\0'),
+            meta.media_storage_sop_instance_uid.trim_end_matches('\0'),
             sop_uid.trim_end_matches('\0'),
         );
     }
@@ -3838,11 +3865,9 @@ mod tests {
             Some(Length(0)),
         );
 
-        assert!(
-            !obj.update_value(tags::BURNED_IN_ANNOTATION, |_value| {
-                panic!("should not be called")
-            }),
-        );
+        assert!(!obj.update_value(tags::BURNED_IN_ANNOTATION, |_value| {
+            panic!("should not be called")
+        }),);
 
         let o = obj.update_value(tags::ANATOMIC_REGION_SEQUENCE, |value| {
             // add an item

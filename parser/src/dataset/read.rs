@@ -336,6 +336,20 @@ impl<S> DataSetReader<S> {
     }
 }
 
+impl<S> DataSetReader<S>
+where
+    S: StatefulDecode,
+{
+    /// Get the current byte position in the underlying source reader.
+    ///
+    /// The position is measured from the point where the reader was created.
+    /// It can be used to recover the absolute position of data tokens
+    /// when the source is a seekable or in-memory reader.
+    pub fn position(&self) -> u64 {
+        self.parser.position()
+    }
+}
+
 impl<S> Iterator for DataSetReader<S>
 where
     S: StatefulDecode,

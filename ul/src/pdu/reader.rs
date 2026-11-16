@@ -2,39 +2,18 @@
 use crate::pdu::*;
 use bytes::Buf;
 use dicom_encoding::text::{DefaultCharacterSetCodec, TextCodec};
-use snafu::{ensure, OptionExt, ResultExt};
+use snafu::{OptionExt, ResultExt, ensure};
 use tracing::warn;
 
 pub type Error = crate::pdu::ReadError;
 
 pub type Result<T> = std::result::Result<T, Error>;
 
-/// The default maximum PDU size
-#[deprecated(since = "0.8.0", note = "Use dicom_ul::pdu::DEFAULT_MAX_PDU instead")]
-pub const DEFAULT_MAX_PDU: u32 = crate::pdu::DEFAULT_MAX_PDU;
-
-/// The minimum PDU size,
-/// as specified by the standard
-#[deprecated(since = "0.8.0", note = "Use dicom_ul::pdu::MINIMUM_PDU_SIZE instead")]
-pub const MINIMUM_PDU_SIZE: u32 = crate::pdu::MINIMUM_PDU_SIZE;
-
-/// The maximum PDU size,
-/// as specified by the standard
-#[deprecated(since = "0.8.0", note = "Use dicom_ul::pdu::MAXIMUM_PDU_SIZE instead")]
-pub const MAXIMUM_PDU_SIZE: u32 = crate::pdu::MAXIMUM_PDU_SIZE;
-
-/// The length of the PDU header in bytes,
-/// comprising the PDU type (1 byte),
-/// reserved byte (1 byte),
-/// and PDU length (4 bytes).
-#[deprecated(since = "0.8.0", note = "Use dicom_ul::pdu::PDU_HEADER_SIZE instead")]
-pub const PDU_HEADER_SIZE: u32 = crate::pdu::PDU_HEADER_SIZE;
-
 /// Read a PDU from the given byte buffer.
 pub fn read_pdu(mut buf: impl Buf, max_pdu_length: u32, strict: bool) -> Result<Option<Pdu>> {
     ensure!(
         (super::MINIMUM_PDU_SIZE..=super::MAXIMUM_PDU_SIZE).contains(&max_pdu_length),
-        InvalidMaxPduSnafu { max_pdu_length }
+        InvalidMaxPduSnafu { max_pdu_length },
     );
 
     // If we can't read 2 bytes here, that means that there is no PDU
@@ -53,28 +32,14 @@ pub fn read_pdu(mut buf: impl Buf, max_pdu_length: u32, strict: bool) -> Result<
     let pdu_length = buf.get_u32();
 
     // Check max_pdu_length
-    if strict {
-        ensure!(
-            pdu_length <= max_pdu_length,
-            PduTooLargeSnafu {
-                pdu_length,
-                max_pdu_length
-            }
-        );
-    } else if pdu_length > max_pdu_length {
-        ensure!(
-            pdu_length <= super::MAXIMUM_PDU_SIZE,
-            PduTooLargeSnafu {
-                pdu_length,
-                max_pdu_length: super::MAXIMUM_PDU_SIZE
-            }
-        );
-        tracing::warn!(
-            "Incoming pdu was too large: length {}, maximum is {}",
+    ensure!(
+        !strict || pdu_length <= max_pdu_length,
+        PduTooLargeSnafu {
             pdu_length,
-            max_pdu_length
-        );
-    }
+            max_pdu_length,
+        }
+    );
+
     if buf.remaining() < pdu_length as usize {
         return Ok(None);
     }
@@ -94,9 +59,10 @@ pub fn read_pdu(mut buf: impl Buf, max_pdu_length: u32, strict: bool) -> Result<
             // Version 1 and shall be identified with bit 0 set. A receiver of this PDU
             // implementing only this version of the DICOM UL protocol shall only test that bit
             // 0 is set.
-            if bytes.remaining() < 2 + 2 + 16 + 16 + 32 {
-                return Ok(None);
-            }
+            ensure!(
+                bytes.remaining() >= 2 + 2 + 16 + 16 + 32,
+                InvalidPduFieldLengthSnafu {},
+            );
             let protocol_version = bytes.get_u16();
 
             // 9-10 - Reserved - This reserved field shall be sent with a value 0000H but not
@@ -155,7 +121,7 @@ pub fn read_pdu(mut buf: impl Buf, max_pdu_length: u32, strict: bool) -> Result<
                     }
                     None => {
                         tracing::debug!("PDU variable none");
-                        return Ok(None);
+                        return ReadUserVariableSnafu {}.fail();
                     }
                 }
             }
@@ -182,9 +148,10 @@ pub fn read_pdu(mut buf: impl Buf, max_pdu_length: u32, strict: bool) -> Result<
             // Version 1 and shall be identified with bit 0 set. A receiver of this PDU
             // implementing only this version of the DICOM UL protocol shall only test that bit
             // 0 is set.
-            if bytes.remaining() < 2 + 2 + 16 + 16 + 32 {
-                return Ok(None);
-            }
+            ensure!(
+                bytes.remaining() >= 2 + 2 + 16 + 16 + 32,
+                InvalidPduFieldLengthSnafu {},
+            );
             let protocol_version = bytes.get_u16();
 
             // 9-10 - Reserved - This reserved field shall be sent with a value 0000H but not
@@ -238,7 +205,9 @@ pub fn read_pdu(mut buf: impl Buf, max_pdu_length: u32, strict: bool) -> Result<
                     Some(var_item) => {
                         return InvalidPduVariableSnafu { var_item }.fail();
                     }
-                    None => return Ok(None),
+                    None => {
+                        return ReadUserVariableSnafu {}.fail();
+                    }
                 }
             }
 
@@ -257,9 +226,10 @@ pub fn read_pdu(mut buf: impl Buf, max_pdu_length: u32, strict: bool) -> Result<
 
             // 7 - Reserved - This reserved field shall be sent with a value 00H but not tested to
             // this value when received.
-            if bytes.remaining() < 1 + 1 + 2 {
-                return Ok(None);
-            }
+            ensure!(
+                bytes.remaining() >= 1 + 1 + 2,
+                InvalidPduFieldLengthSnafu {}
+            );
             bytes.get_u8();
 
             // 8 - Result - This Result field shall contain an integer value encoded as an unsigned
@@ -270,8 +240,9 @@ pub fn read_pdu(mut buf: impl Buf, max_pdu_length: u32, strict: bool) -> Result<
                 .context(InvalidRejectSourceOrReasonSnafu)?;
 
             // 9 - Source - This Source field shall contain an integer value encoded as an unsigned
-            // binary number. One of the following values shall be used:   1 - DICOM UL
-            // service-user   2 - DICOM UL service-provider (ACSE related function)
+            // binary number. One of the following values shall be used:
+            //   1 - DICOM UL service-user
+            //   2 - DICOM UL service-provider (ACSE related function)
             //   3 - DICOM UL service-provider (Presentation related function)
             // 10 - Reason/Diag. - This field shall contain an integer value encoded as an unsigned
             // binary number.   If the Source field has the value (1) "DICOM UL
@@ -283,11 +254,13 @@ pub fn read_pdu(mut buf: impl Buf, max_pdu_length: u32, strict: bool) -> Result<
             //     7 - called-AE-title-not-recognized
             //     8-10 - reserved
             //   If the Source field has the value (2) "DICOM UL service provided (ACSE related
-            // function)", it shall take one of the following:     1 - no-reason-given
+            // function)", it shall take one of the following:
+            //     1 - no-reason-given
             //     2 - protocol-version-not-supported
             //   If the Source field has the value (3) "DICOM UL service provided (Presentation
-            // related function)", it shall take one of the following:     0 - reserved
-            //     1 - temporary-congestio
+            // related function)", it shall take one of the following:
+            //     0 - reserved
+            //     1 - temporary-congestion
             //     2 - local-limit-exceeded
             //     3-7 - reserved
             let source = AssociationRJSource::from(bytes.get_u8(), bytes.get_u8())
@@ -308,16 +281,20 @@ pub fn read_pdu(mut buf: impl Buf, max_pdu_length: u32, strict: bool) -> Result<
                 // 1-4 - Item-length - This Item-length shall be the number of bytes from the first
                 // byte of the following field to the last byte of the Presentation-data-value
                 // field. It shall be encoded as an unsigned binary number.
-                if bytes.remaining() < 4 + 1 + 1 {
-                    return Ok(None);
-                }
+
+                // Clippy warns here that `>= x+1` could be written as `> x`,
+                // unaware that 4 + 1 + 1 is the total length to expect and
+                // thus clearer to read, so we override it.
+                #[allow(clippy::int_plus_one)]
+                let enough_remaining = bytes.remaining() >= 4 + 1 + 1;
+                ensure!(enough_remaining, InvalidPduFieldLengthSnafu {});
                 let item_length = bytes.get_u32();
 
                 ensure!(
                     item_length >= 2,
                     InvalidItemLengthSnafu {
                         length: item_length
-                    }
+                    },
                 );
 
                 // 5 - Presentation-context-ID - Presentation-context-ID values shall be odd
@@ -346,9 +323,10 @@ pub fn read_pdu(mut buf: impl Buf, max_pdu_length: u32, strict: bool) -> Result<
                     PDataValueType::Data
                 };
                 let is_last = (header & 0x02) > 0;
-                if bytes.remaining() < (item_length - 2) as usize {
-                    return Ok(None);
-                }
+                ensure!(
+                    bytes.remaining() >= (item_length - 2) as usize,
+                    InvalidPduFieldLengthSnafu {},
+                );
                 values.push(PDataValue {
                     presentation_context_id,
                     value_type,
@@ -364,9 +342,7 @@ pub fn read_pdu(mut buf: impl Buf, max_pdu_length: u32, strict: bool) -> Result<
 
             // 7-10 - Reserved - This reserved field shall be sent with a value 00000000H but not
             // tested to this value when received.
-            if bytes.remaining() < 4 {
-                return Ok(None);
-            }
+            ensure!(bytes.remaining() >= 4, InvalidPduFieldLengthSnafu {});
             bytes.advance(4);
 
             Ok(Some(Pdu::ReleaseRQ))
@@ -376,9 +352,7 @@ pub fn read_pdu(mut buf: impl Buf, max_pdu_length: u32, strict: bool) -> Result<
 
             // 7-10 - Reserved - This reserved field shall be sent with a value 00000000H but not
             // tested to this value when received.
-            if bytes.remaining() < 4 {
-                return Ok(None);
-            }
+            ensure!(bytes.remaining() >= 4, InvalidPduFieldLengthSnafu {});
             bytes.advance(4);
 
             Ok(Some(Pdu::ReleaseRP))
@@ -390,9 +364,7 @@ pub fn read_pdu(mut buf: impl Buf, max_pdu_length: u32, strict: bool) -> Result<
             // this value when received.
             // 8 - Reserved - This reserved field shall be sent with a value 00H but not tested to
             // this value when received.
-            if bytes.remaining() < 2 + 2 {
-                return Ok(None);
-            }
+            ensure!(bytes.remaining() >= 2 + 2, InvalidPduFieldLengthSnafu {});
             let _ = bytes.copy_to_bytes(2);
 
             // 9 - Source - This Source field shall contain an integer value encoded as an unsigned
@@ -415,9 +387,10 @@ pub fn read_pdu(mut buf: impl Buf, max_pdu_length: u32, strict: bool) -> Result<
             Ok(Some(Pdu::AbortRQ { source }))
         }
         _ => {
-            if bytes.remaining() < pdu_length as usize {
-                return Ok(None);
-            }
+            ensure!(
+                bytes.remaining() >= pdu_length as usize,
+                InvalidPduFieldLengthSnafu {},
+            );
             Ok(Some(Pdu::Unknown {
                 pdu_type,
                 data: bytes.copy_to_bytes(pdu_length as usize).to_vec(),
@@ -760,6 +733,66 @@ fn read_pdu_variable(mut buf: impl Buf, codec: &dyn TextCodec) -> Result<Option<
                             implementation_class_uid,
                         ));
                     }
+                    0x54 => {
+                        // SCP/SCU Role Selection Sub-Item Structure
+
+                        // 5-6 - UID-length - This UID-length shall be the number of bytes from the
+                        // first byte of the following field to the last byte of the SOP-class-uid
+                        // field. It shall be encoded as an unsigned binary number.
+                        if bytes.remaining() < 2 {
+                            return Ok(None);
+                        }
+                        let sop_class_uid_length = bytes.get_u16();
+
+                        // 7 - xxx - SOP-class-uid - The SOP Class or Meta SOP Class identifier
+                        // encoded as a UID as defined in Section 9 “Unique Identifiers (UIDs)” in PS3.5.
+                        if bytes.remaining() < sop_class_uid_length as usize {
+                            return Ok(None);
+                        }
+                        let sop_class_uid = codec
+                            .decode(bytes.copy_to_bytes(sop_class_uid_length as usize).as_ref())
+                            .context(DecodeTextSnafu {
+                                field: "SOP-class-uid",
+                            })?
+                            .trim()
+                            .to_string();
+
+                        // xxx - SCU-role - This byte field shall contain the SCU-role as defined in
+                        // Section D.3.3.4. It shall be encoded as an unsigned binary and shall use
+                        // one of the following values:
+                        //
+                        // 0 - The Association-acceptor rejects the Association-requestor's proposal
+                        // of the SCU role selection
+                        //
+                        // 1 - The Association-acceptor accepts the Association-requestor's proposal
+                        // of the SCU role selection
+                        if bytes.remaining() < 1 {
+                            return Ok(None);
+                        }
+                        let scu_role = bytes.get_u8() != 0;
+
+                        // xxx - SCP-role - This byte field shall contain the SCP-role as defined
+                        // for the Association-acceptor in Section D.3.3.4. It shall be encoded as
+                        // an unsigned binary and shall use one of the following values:
+                        //
+                        // 0 - The Association-acceptor rejects the Association-requestor's proposal
+                        // of the SCP role selection
+                        //
+                        // 1 - The Association-acceptor accepts the Association-requestor's proposal
+                        // of the SCP role selection
+                        if bytes.remaining() < 1 {
+                            return Ok(None);
+                        }
+                        let scp_role = bytes.get_u8() != 0;
+
+                        user_variables.push(UserVariableItem::ScuScpRoleSelectionSubItem(
+                            sop_class_uid,
+                            RequestorRoles {
+                                scu: scu_role,
+                                scp: scp_role,
+                            },
+                        ));
+                    }
                     0x55 => {
                         // Implementation Version Name Structure
 
@@ -797,6 +830,16 @@ fn read_pdu_variable(mut buf: impl Buf, codec: &dyn TextCodec) -> Result<Option<
                         if bytes.remaining() < sop_class_uid_length as usize {
                             return Ok(None);
                         }
+
+                        // check item length against SOP class UID length
+                        ensure!(
+                            item_length >= 2 + sop_class_uid_length,
+                            ShortSopClassExtendedNegotiationItemLengthSnafu {
+                                length: item_length,
+                                sop_class_uid_length,
+                            }
+                        );
+
                         let sop_class_uid = codec
                             .decode(bytes.copy_to_bytes(sop_class_uid_length as usize).as_ref())
                             .context(DecodeTextSnafu {
@@ -805,19 +848,22 @@ fn read_pdu_variable(mut buf: impl Buf, codec: &dyn TextCodec) -> Result<Option<
                             .trim()
                             .to_string();
 
-                        if bytes.remaining() < 2 {
+                        // The fixed part of the Extended Negotiation Sub-Item length includes only
+                        // the SOP Class UID's length, which is a 2-byte field. The variable part
+                        // includes the SOP Class UID and the Service-Class-Application-Information
+                        // (PS3.7 D.3.3.5.1). We want to calculate the size of the latter, which
+                        // equals the total item length minus the other fixed and variable lengths.
+                        let data_length = (item_length - 2 - sop_class_uid_length) as usize;
+
+                        if bytes.remaining() < data_length {
                             return Ok(None);
                         }
-                        let data_length = bytes.get_u16();
 
                         // xxx-xxx - Service-class-application-information -This field shall contain
                         // the application information specific to the Service Class specification
                         // identified by the SOP-class-uid. The semantics and value of this field
                         // is defined in the identified Service Class specification.
-                        if bytes.remaining() < data_length as usize {
-                            return Ok(None);
-                        }
-                        let data = bytes.copy_to_bytes(data_length as usize);
+                        let data = bytes.copy_to_bytes(data_length);
                         user_variables.push(UserVariableItem::SopClassExtendedNegotiationSubItem(
                             sop_class_uid,
                             data.to_vec(),

@@ -14,9 +14,11 @@
 //! # Example
 //!
 //! Given a DICOM object
-//! (opened using [`dicom_object`](https://docs.rs/dicom-object)),
+//! (opened using [`dicom_object`]),
 //! construct an [`AttributeOp`]
-//! and apply it using [`apply`](ApplyOp::apply).
+//! and apply it using [`ApplyOp::apply`].
+//!
+//! [`dicom_object`]: https://docs.rs/dicom_object
 //!
 //! ```no_run
 //! # use dicom_core::Tag;
@@ -45,7 +47,7 @@
 //! ```
 use std::{borrow::Cow, fmt::Write};
 
-use smallvec::{smallvec, SmallVec};
+use smallvec::{SmallVec, smallvec};
 
 use crate::{PrimitiveValue, Tag, VR};
 
@@ -101,13 +103,16 @@ impl AttributeOp {
 
 /// A single step of an attribute selection.
 ///
-/// A selector step may either select an element directly at the root (`Tag`)
-/// or a specific item in a sequence to navigate into (`Nested`).
+/// A selector step may either select an element directly at the root ([`Tag`])
+/// or a specific item in a sequence to navigate into ([`Nested`]).
 ///
 /// A full attribute selector can be specified
 /// by using a sequence of these steps
-/// (but should always end with the `Tag` variant,
+/// (but should always end with the [`Tag`] variant,
 /// otherwise the operation would be unspecified).
+///
+/// [`Tag`]: Self::Tag
+/// [`Nested`]: Self::Nested
 #[derive(Debug, Copy, Clone, Eq, Hash, PartialEq)]
 pub enum AttributeSelectorStep {
     /// Select the element with the tag reachable at the root of this data set
@@ -134,8 +139,11 @@ impl From<(Tag, u32)> for AttributeSelectorStep {
 
 impl std::fmt::Display for AttributeSelectorStep {
     /// Displays the attribute selector step:
-    /// `(GGGG,EEEE)` if `Tag`,,
-    /// `(GGGG,EEEE)[i]` if `Nested`
+    /// `(GGGG,EEEE)` if [`Tag`],
+    /// `(GGGG,EEEE)[i]` if [`Nested`]
+    ///
+    /// [`Tag`]: Self::Tag
+    /// [`Nested`]: Self::Nested
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             AttributeSelectorStep::Tag(tag) => std::fmt::Display::fmt(tag, f),
@@ -157,29 +165,30 @@ impl std::fmt::Display for AttributeSelectorStep {
 /// the dynamic constructor function [`new`],
 /// or through parsing.
 ///
+/// [`new`]: Self::new
+///
 /// # Syntax
 ///
 /// A syntax is defined for the unambiguous conversion
-/// between a string and an `AttributeSelector` value,
+/// between a string and an [`AttributeSelector`] value,
 /// in both directions.
 /// Attribute selectors are defined by the syntax
 /// `( «key»([«item»])? . )* «key» `
 /// where:
 ///
 /// - _`«key»`_ is either a DICOM tag in a supported textual form,
-///   or a tag keyword as accepted by the [data dictionary][dict] in use;
+///   or a tag keyword as accepted by the [`crate::dictionary::DataDictionary`]
+///   in use;
 /// - _`«item»`_ is an unsigned integer representing the item index,
 ///   which is always surrounded by square brackets in the input;
 /// - _`[`_, _`]`_, and _`.`_ are literally their own characters
 ///   as part of the input.
 ///
-/// [dict]: crate::dictionary::DataDictionary
-///
 /// The first part in parentheses may appear zero or more times.
 /// The `[«item»]` part can be omitted,
 /// in which case it is assumed that the first item is selected.
 /// Whitespace is not admitted in any position.
-/// Displaying a selector through the [`Display`](std::fmt::Display) trait
+/// Displaying a selector through the [`std::fmt::Display`] trait
 /// produces a string that is compliant with this syntax.
 ///
 /// ### Examples of attribute selectors in text:
@@ -199,7 +208,7 @@ impl std::fmt::Display for AttributeSelectorStep {
 ///
 /// In most cases, you might only wish to select an attribute
 /// that is sitting at the root of the data set.
-/// This can be done by converting a [DICOM tag](crate::Tag) via [`From<Tag>`]:
+/// This can be done by converting a [`tag`](Tag) via [`From<Tag>`]:
 ///
 /// ```
 /// # use dicom_core::Tag;
@@ -234,8 +243,6 @@ impl std::fmt::Display for AttributeSelectorStep {
 /// Note that the function fails
 /// if the last step refers to a sequence item.
 ///
-/// [`new`]: AttributeSelector::new
-///
 /// ```
 /// # use dicom_core::Tag;
 /// # use dicom_core::ops::{AttributeSelector, AttributeSelectorStep};
@@ -253,8 +260,10 @@ impl std::fmt::Display for AttributeSelectorStep {
 /// # Result::<_, &'static str>::Ok(())
 /// ```
 ///
-/// A data dictionary's [`parse_selector`][parse] method
-/// can be used if you want to describe these selectors in text.
+/// A data dictionary's [`DataDictionary::parse_selector`]
+/// method can be used if you want to describe these selectors in text.
+///
+/// [`DataDictionary::parse_selector`]: crate::dictionary::DataDictionary::parse_selector
 ///
 /// ```no_run
 /// # // compile only: we don't have the std dict here
@@ -281,8 +290,6 @@ impl std::fmt::Display for AttributeSelectorStep {
 /// );
 /// # Result::<_, Box<dyn std::error::Error>>::Ok(())
 /// ```
-///
-/// [parse]: crate::dictionary::DataDictionary::parse_selector
 ///
 /// Selectors can be decomposed back into its constituent steps
 /// by turning it into an iterator:
@@ -313,16 +320,15 @@ impl AttributeSelector {
     /// Construct an attribute selector
     /// from an arbitrary sequence of selector steps.
     ///
-    /// Intermediate steps of variant [`Tag`][1]
+    /// Intermediate steps of variant [`AttributeSelectorStep::Tag`]
     /// (which do not specify an item index)
     /// are automatically reinterpreted as item selectors for item index 0.
     ///
-    /// Returns `None` if the sequence is empty
+    /// Returns [`None`] if the sequence is empty
     /// or the last step is not a tag selector step.
-    ///
-    /// [1]: AttributeSelectorStep::Tag
     pub fn new(steps: impl IntoIterator<Item = AttributeSelectorStep>) -> Option<Self> {
         let mut steps: SmallVec<_> = steps.into_iter().collect();
+        debug_assert!(steps.len() < 256);
         let (last, rest) = steps.split_last_mut()?;
         if matches!(last, AttributeSelectorStep::Nested { .. }) {
             return None;
@@ -336,14 +342,38 @@ impl AttributeSelector {
         Some(AttributeSelector(steps))
     }
 
+    /// Split this attribute selector into the first step
+    /// and its remainder.
+    ///
+    /// If the first part of the tuple is the last step of the selector,
+    /// the first item will be of the variant [`AttributeSelectorStep::Tag`]
+    /// and the second item of the tuple will be `None`.
+    /// Otherwise,
+    /// the first item is guaranteed to be of the variant
+    /// [`AttributeSelectorStep::Nested`].
+    pub fn split_first(&self) -> (AttributeSelectorStep, Option<AttributeSelector>) {
+        match self.0.split_first() {
+            Some((first, rest)) => {
+                let rest = if rest.is_empty() {
+                    None
+                } else {
+                    Some(AttributeSelector(rest.into()))
+                };
+                (*first, rest)
+            }
+            None => {
+                unreachable!("invariant broken: attribute selector should have at least one step")
+            }
+        }
+    }
+
     /// Return a non-empty iterator over the steps of attribute selection.
     ///
     /// The iterator is guaranteed to produce a series
-    /// starting with zero or more steps of the variant [`Nested`][1],
-    /// and terminated by one item guaranteed to be a [tag][2].
-    ///
-    /// [1]: AttributeSelectorStep::Nested
-    /// [2]: AttributeSelectorStep::Tag
+    /// starting with zero or more steps of the variant
+    /// [`AttributeSelectorStep::Nested`],
+    /// and terminated by one item guaranteed to be a
+    /// [`AttributeSelectorStep::Tag`].
     pub fn iter(&self) -> impl Iterator<Item = &AttributeSelectorStep> {
         self.into_iter()
     }
@@ -371,6 +401,14 @@ impl AttributeSelector {
             _ => unreachable!("invariant broken: last attribute selector step should be Tag"),
         }
     }
+
+    /// Obtain the number of steps of the selector.
+    ///
+    /// Since selectors cannot be empty,
+    /// the number of steps is always larger than zero.
+    pub fn num_steps(&self) -> u32 {
+        self.0.len() as u32
+    }
 }
 
 impl IntoIterator for AttributeSelector {
@@ -380,11 +418,10 @@ impl IntoIterator for AttributeSelector {
     /// Returns a non-empty iterator over the steps of attribute selection.
     ///
     /// The iterator is guaranteed to produce a series
-    /// starting with zero or more steps of the variant [`Nested`][1],
-    /// and terminated by one item guaranteed to be a [tag][2].
-    ///
-    /// [1]: AttributeSelectorStep::Nested
-    /// [2]: AttributeSelectorStep::Tag
+    /// starting with zero or more steps of the variant
+    /// [`AttributeSelectorStep::Nested`],
+    /// and terminated by one item guaranteed to be a
+    /// [`AttributeSelectorStep::Tag`].
     fn into_iter(self) -> Self::IntoIter {
         self.0.into_iter()
     }
@@ -397,11 +434,10 @@ impl<'a> IntoIterator for &'a AttributeSelector {
     /// Returns a non-empty iterator over the steps of attribute selection.
     ///
     /// The iterator is guaranteed to produce a series
-    /// starting with zero or more steps of the variant [`Nested`][1],
-    /// and terminated by one item guaranteed to be a [tag][2].
-    ///
-    /// [1]: AttributeSelectorStep::Nested
-    /// [2]: AttributeSelectorStep::Tag
+    /// starting with zero or more steps of the variant
+    /// [`AttributeSelectorStep::Nested`],
+    /// and terminated by one item guaranteed to be a
+    /// [`AttributeSelectorStep::Tag`].
     fn into_iter(self) -> Self::IntoIter {
         self.0.iter()
     }
@@ -674,17 +710,54 @@ pub trait ApplyOp {
 
 #[cfg(test)]
 mod tests {
-    use crate::{ops::AttributeSelector, Tag};
+    use crate::{
+        Tag,
+        ops::{AttributeSelector, AttributeSelectorStep},
+    };
 
     #[test]
     fn display_selectors() {
         let selector: AttributeSelector = Tag(0x0014, 0x5100).into();
-        assert_eq!(selector.to_string(), "(0014,5100)",);
+        assert_eq!(selector.to_string(), "(0014,5100)");
 
         let selector: AttributeSelector = (Tag(0x0018, 0x6011), 2, Tag(0x0018, 0x6012)).into();
-        assert_eq!(selector.to_string(), "(0018,6011)[2].(0018,6012)",);
+        assert_eq!(selector.to_string(), "(0018,6011)[2].(0018,6012)");
 
         let selector = AttributeSelector::from((Tag(0x0040, 0xA730), 1, Tag(0x0040, 0xA730)));
-        assert_eq!(selector.to_string(), "(0040,A730)[1].(0040,A730)",);
+        assert_eq!(selector.to_string(), "(0040,A730)[1].(0040,A730)");
+    }
+
+    #[test]
+    fn split_selectors() {
+        let selector: AttributeSelector = Tag(0x0014, 0x5100).into();
+        assert_eq!(
+            selector.split_first(),
+            (AttributeSelectorStep::Tag(Tag(0x0014, 0x5100)), None)
+        );
+
+        let selector: AttributeSelector = (Tag(0x0018, 0x6011), 2, Tag(0x0018, 0x6012)).into();
+        assert_eq!(
+            selector.split_first(),
+            (
+                AttributeSelectorStep::Nested {
+                    tag: Tag(0x0018, 0x6011),
+                    item: 2
+                },
+                Some(Tag(0x0018, 0x6012).into())
+            )
+        );
+
+        // selector constructor automatically turns the first entry into `Nested`
+        let selector = AttributeSelector::from((Tag(0x0040, 0xA730), Tag(0x0040, 0xA730)));
+        assert_eq!(
+            selector.split_first(),
+            (
+                AttributeSelectorStep::Nested {
+                    tag: Tag(0x0040, 0xA730),
+                    item: 0
+                },
+                Some(Tag(0x0040, 0xA730).into())
+            )
+        );
     }
 }

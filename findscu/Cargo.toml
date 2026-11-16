@@ -1,8 +1,8 @@
 [package]
 name = "dicom-findscu"
-version = "0.8.2"
+version = "0.10.1"
 authors = ["Eduardo Pinho <enet4mikeenet@gmail.com>"]
-edition = "2021"
+edition = "2024"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/Enet4/dicom-rs"
 description = "A DICOM C-FIND command line interface"
@@ -11,14 +11,15 @@ keywords = ["dicom", "query", "search"]
 readme = "README.md"
 
 [dependencies]
-dicom-core = { path = '../core', version = "0.8.2" }
-dicom-ul = { path = '../ul', version = "0.8.2" }
-dicom-object = { path = '../object', version = "0.8.2" }
-dicom-encoding = { path = "../encoding/", version = "0.8.2" }
-dicom-dictionary-std = { path = "../dictionary-std/", version = "0.8.1" }
-dicom-transfer-syntax-registry = { path = "../transfer-syntax-registry/", version = "0.8.2" }
-dicom-dump = { path = "../dump", default-features = false, version = "0.8.1" }
+dicom-app-common = { version = "0.10.1", path = "../app-common", default-features = false }
+dicom-core = { path = '../core', version = "0.10.1" }
+dicom-ul = { path = "../ul", version = "0.10.1" }
+dicom-object = { path = "../object", version = "0.10.1" }
+dicom-encoding = { path = "../encoding", version = "0.10.1" }
+dicom-dictionary-std = { path = "../dictionary-std", version = "0.10.1" }
+dicom-transfer-syntax-registry = { path = "../transfer-syntax-registry", version = "0.10.1" }
+dicom-dump = { path = "../dump", version = "0.10.1", default-features = false }
 clap = { version = "4.0.18", features = ["derive"] }
-snafu = "0.8"
+snafu = "0.9"
 tracing = "0.1.36"
-tracing-subscriber = "0.3.15"
+tracing-subscriber = "0.3.20"

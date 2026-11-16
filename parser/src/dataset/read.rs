@@ -4,11 +4,15 @@
 //! The rest of the crate is used to obtain DICOM element headers and values.
 //! At this level, headers and values are treated as tokens which can be used
 //! to form a syntax tree of a full data set.
-use crate::stateful::decode::{DynStatefulDecoder, Error as DecoderError, StatefulDecode};
+use crate::stateful::decode::{
+    CharacterSetOverride, DynStatefulDecoder, Error as DecoderError, StatefulDecode,
+    StatefulDecoder,
+};
 use dicom_core::header::{DataElementHeader, Header, Length, SequenceItemHeader};
 use dicom_core::{PrimitiveValue, Tag, VR};
+use dicom_encoding::decode::adaptive_le::StandardAdaptiveVRLittleEndianDecoder;
 use dicom_encoding::text::SpecificCharacterSet;
-use dicom_encoding::transfer_syntax::TransferSyntax;
+use dicom_encoding::transfer_syntax::{DynDecoder, TransferSyntax};
 use snafu::{Backtrace, ResultExt, Snafu};
 use std::cmp::Ordering;
 use std::io::Read;
@@ -78,6 +82,18 @@ pub enum Error {
     InvalidElementLength { tag: Tag, len: u32, bytes_read: u64 },
     /// Invalid sequence item length {len:04X} at {bytes_read:#x}
     InvalidItemLength { len: u32, bytes_read: u64 },
+    /// Could not reserve memory for the offset table ({len} bytes)
+    AllocateOffsetTable {
+        /// the length of the attempted allocation
+        len: u32,
+        source: std::collections::TryReserveError,
+    },
+    /// Could not reserve memory for the offset table ({len} bytes)
+    AllocateItem {
+        /// the length of the attempted allocation
+        len: u32,
+        source: std::collections::TryReserveError,
+    },
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
@@ -156,11 +172,25 @@ pub enum OddLengthStrategy {
 pub struct DataSetReaderOptions {
     /// The value reading strategy
     pub value_read: ValueReadStrategy,
+
+    /// Whether to assume a different character set
+    /// depending on certain conditions
+    pub charset_override: CharacterSetOverride,
+
     /// The strategy for handling odd length data elements
     pub odd_length: OddLengthStrategy,
     /// The position of the reader as received at building time in bytes.
     /// Defaults to 0.
     pub base_offset: u64,
+
+    /// When enabled, the decoder will probe the first non-meta element
+    /// to determine whether the dataset actually uses explicit or implicit VR,
+    /// regardless of what the transfer syntax declares.
+    ///
+    /// This handles non-conformant files that declare Explicit VR Little Endian
+    /// but actually encode the dataset in Implicit VR.
+    /// Defaults to `false`.
+    pub flexible_decoding: bool,
 }
 
 impl DataSetReaderOptions {
@@ -172,6 +202,11 @@ impl DataSetReaderOptions {
     /// Replace the base reader offset of the options.
     pub fn base_offset(mut self, base_offset: u64) -> Self {
         self.base_offset = base_offset;
+        self
+    }
+    /// Enable or disable flexible VR decoding.
+    pub fn flexible_decoding(mut self, flexible_decoding: bool) -> Self {
+        self.flexible_decoding = flexible_decoding;
         self
     }
 }
@@ -250,7 +285,23 @@ impl<R> DataSetReader<DynStatefulDecoder<R>> {
     where
         R: Read,
     {
-        let parser = DynStatefulDecoder::new_with(source, ts, cs, 0).context(CreateDecoderSnafu)?;
+        let parser = if options.flexible_decoding
+            && ts.endianness() == dicom_encoding::Endianness::Little
+        {
+            let basic = ts.basic_decoder();
+            let decoder: DynDecoder<R> = Box::<StandardAdaptiveVRLittleEndianDecoder>::default();
+            StatefulDecoder::new_with_all_options(
+                source,
+                decoder,
+                basic,
+                cs,
+                options.charset_override,
+                0,
+            )
+        } else {
+            DynStatefulDecoder::new_with_override(source, ts, cs, options.charset_override, 0)
+                .context(CreateDecoderSnafu)?
+        };
 
         is_stateful_decode(&parser);
 
@@ -292,323 +343,339 @@ where
     type Item = Result<DataToken>;
 
     fn next(&mut self) -> Option<Self::Item> {
-        println!("asdf self.parser.position() {:?}", self.parser.position());
-        if self.hard_break {
-            return None;
-        }
-        // if there was a peek, consume peeked token
-        if let Some(token) = self.peek.take() {
-            return Some(Ok(token));
-        }
-
-        // item or sequence delimitation logic for explicit lengths
-        if self.delimiter_check_pending {
-            match self.update_seq_delimiters() {
-                Err(e) => {
-                    self.hard_break = true;
-                    return Some(Err(e));
-                }
-                Ok(Some(token)) => return Some(Ok(token)),
-                Ok(None) => { /* no-op */ }
+        loop {
+            if self.hard_break {
+                return None;
             }
-        }
+            // if there was a peek, consume peeked token
+            if let Some(token) = self.peek.take() {
+                return Some(Ok(token));
+            }
 
-        if self.in_sequence {
-            // at sequence level, expecting item header
+            // item or sequence delimitation logic for explicit lengths
+            if self.delimiter_check_pending {
+                match self.update_seq_delimiters() {
+                    Err(e) => {
+                        self.hard_break = true;
+                        return Some(Err(e));
+                    }
+                    Ok(Some(token)) => return Some(Ok(token)),
+                    Ok(None) => { /* no-op */ }
+                }
+            }
 
-            match self.parser.decode_item_header() {
-                Ok(header) => {
-                    match header {
-                        SequenceItemHeader::Item { len } => {
-                            let len = match self.sanitize_length(len) {
-                                Some(len) => len,
-                                None => {
-                                    return Some(
-                                        InvalidItemLengthSnafu {
-                                            bytes_read: self.parser.position(),
-                                            len: len.0,
-                                        }
-                                        .fail(),
-                                    )
+            // This will always return unless we do a `continue`.
+            return if self.in_sequence {
+                // at sequence level, expecting item header
+
+                match self.parser.decode_item_header() {
+                    Ok(header) => {
+                        match header {
+                            SequenceItemHeader::Item { len } => {
+                                let len = match self.sanitize_length(len) {
+                                    Some(len) => len,
+                                    None => {
+                                        return Some(
+                                            InvalidItemLengthSnafu {
+                                                bytes_read: self.parser.position(),
+                                                len: len.0,
+                                            }
+                                            .fail(),
+                                        );
+                                    }
+                                };
+                                // entered a new item
+                                self.in_sequence = false;
+
+                                let last_delimiter = match self.seq_delimiters.last() {
+                                    Some(d) => d,
+                                    None => {
+                                        return Some(
+                                            UnexpectedItemHeaderSnafu {
+                                                bytes_read: self.parser.position(),
+                                            }
+                                            .fail(),
+                                        );
+                                    }
+                                };
+                                self.push_sequence_token(
+                                    SeqTokenType::Item,
+                                    len,
+                                    last_delimiter.pixel_data,
+                                );
+                                // items can be empty
+                                if len == Length(0) {
+                                    self.delimiter_check_pending = true;
                                 }
-                            };
-                            // entered a new item
-                            self.in_sequence = false;
-
-                            let last_delimiter = match self.seq_delimiters.last() {
-                                Some(d) => d,
-                                None => {
-                                    return Some(
-                                        UnexpectedItemHeaderSnafu {
-                                            bytes_read: self.parser.position(),
-                                        }
-                                        .fail(),
-                                    )
-                                }
-                            };
-                            self.push_sequence_token(
-                                SeqTokenType::Item,
-                                len,
-                                last_delimiter.pixel_data,
-                            );
-                            // items can be empty
-                            if len == Length(0) {
-                                self.delimiter_check_pending = true;
+                                Some(Ok(DataToken::ItemStart { len }))
                             }
-                            Some(Ok(DataToken::ItemStart { len }))
-                        }
-                        SequenceItemHeader::ItemDelimiter => {
-                            // closed an item
-                            self.seq_delimiters.pop();
-                            self.in_sequence = true;
-                            // sequences can end after an item delimiter
-                            self.delimiter_check_pending = true;
-                            Some(Ok(DataToken::ItemEnd))
-                        }
-                        SequenceItemHeader::SequenceDelimiter => {
-                            // closed a sequence
-                            self.seq_delimiters.pop();
-                            self.in_sequence = false;
-                            // items can end after a nested sequence ends
-                            self.delimiter_check_pending = true;
-                            Some(Ok(DataToken::SequenceEnd))
+                            SequenceItemHeader::ItemDelimiter => {
+                                // closed an item
+                                self.seq_delimiters.pop();
+                                self.in_sequence = true;
+                                // sequences can end after an item delimiter
+                                self.delimiter_check_pending = true;
+                                Some(Ok(DataToken::ItemEnd))
+                            }
+                            SequenceItemHeader::SequenceDelimiter => {
+                                // closed a sequence
+                                self.seq_delimiters.pop();
+                                self.in_sequence = false;
+                                // items can end after a nested sequence ends
+                                self.delimiter_check_pending = true;
+                                Some(Ok(DataToken::SequenceEnd))
+                            }
                         }
                     }
-                }
-                Err(DecoderError::DecodeItemHeader {
-                    source: dicom_encoding::decode::Error::ReadItemHeader { source, .. },
-                    ..
-                }) if source.kind() == std::io::ErrorKind::UnexpectedEof
-                    && self.seq_delimiters.pop().is_some_and(|t| t.pixel_data) =>
-                {
-                    // Note: if `UnexpectedEof` was reached while inside a
-                    // PixelData Sequence, then we assume that
-                    // the end of a DICOM object was reached gracefully.
-                    self.hard_break = true;
-                    None
-                }
-                Err(e) => {
-                    self.hard_break = true;
-                    Some(Err(e).context(ReadItemHeaderSnafu))
-                }
-            }
-        } else if let Some(SeqToken {
-            typ: SeqTokenType::Item,
-            pixel_data: true,
-            len,
-            ..
-        }) = self.seq_delimiters.last()
-        {
-            let len = match len.get() {
-                Some(len) => len as usize,
-                None => return Some(UndefinedItemLengthSnafu.fail()),
-            };
-
-            if self.offset_table_next {
-                // offset table
-                let mut offset_table = Vec::with_capacity(len);
-
-                self.offset_table_next = false;
-
-                // need to pop item delimiter on the next iteration
-                self.delimiter_check_pending = true;
-
-                Some(
-                    match self.parser.read_u32_to_vec(len as u32, &mut offset_table) {
-                        Ok(()) => Ok(DataToken::OffsetTable(offset_table)),
-                        Err(e) => Err(e).context(ReadItemValueSnafu { len: len as u32 }),
-                    },
-                )
-            } else {
-                // item value
-                let mut value = Vec::with_capacity(len);
-
-                // need to pop item delimiter on the next iteration
-                self.delimiter_check_pending = true;
-                Some(
-                    self.parser
-                        .read_to_vec(len as u32, &mut value)
-                        .map(|_| Ok(DataToken::ItemValue(value)))
-                        .unwrap_or_else(|e| Err(e).context(ReadItemValueSnafu { len: len as u32 })),
-                )
-            }
-        } else if let Some(header) = self.last_header {
-            if header.is_encapsulated_pixeldata() {
-                self.push_sequence_token(SeqTokenType::Sequence, Length::UNDEFINED, true);
-                self.last_header = None;
-
-                // encapsulated pixel data, expecting offset table
-                match self.parser.decode_item_header() {
-                    Ok(header) => match header {
-                        SequenceItemHeader::Item { len } => {
-                            let len = match self.sanitize_length(len) {
-                                Some(len) => len,
-                                None => {
-                                    return Some(
-                                        InvalidItemLengthSnafu {
-                                            bytes_read: self.parser.position(),
-                                            len: len.0,
-                                        }
-                                        .fail(),
-                                    )
-                                }
-                            };
-
-                            // entered a new item
-                            self.in_sequence = false;
-                            self.push_sequence_token(SeqTokenType::Item, len, true);
-                            // items can be empty
-                            if len == Length(0) {
-                                self.delimiter_check_pending = true;
-                            } else {
-                                self.offset_table_next = true;
-                            }
-                            Some(Ok(DataToken::ItemStart { len }))
-                        }
-                        SequenceItemHeader::SequenceDelimiter => {
-                            // empty pixel data
-                            self.seq_delimiters.pop();
-                            self.in_sequence = false;
-                            Some(Ok(DataToken::SequenceEnd))
-                        }
-                        item => {
-                            self.hard_break = true;
-                            Some(UnexpectedItemTagSnafu { tag: item.tag() }.fail())
-                        }
-                    },
+                    Err(DecoderError::DecodeItemHeader {
+                        source: dicom_encoding::decode::Error::ReadItemHeader { source, .. },
+                        ..
+                    }) if source.kind() == std::io::ErrorKind::UnexpectedEof
+                        && self.seq_delimiters.pop().is_some_and(|t| t.pixel_data) =>
+                    {
+                        // Note: if `UnexpectedEof` was reached while inside a
+                        // PixelData Sequence, then we assume that
+                        // the end of a DICOM object was reached gracefully.
+                        self.hard_break = true;
+                        None
+                    }
                     Err(e) => {
                         self.hard_break = true;
                         Some(Err(e).context(ReadItemHeaderSnafu))
                     }
                 }
-            } else {
-                // a plain element header was read, so a value is expected
-                let value = match self.read_value(&header) {
-                    Ok(v) => v,
-                    Err(e) => {
-                        self.hard_break = true;
-                        self.last_header = None;
-                        return Some(Err(e));
-                    }
+            } else if let Some(SeqToken {
+                typ: SeqTokenType::Item,
+                pixel_data: true,
+                len,
+                ..
+            }) = self.seq_delimiters.last()
+            {
+                let len = match len.get() {
+                    Some(len) => len as usize,
+                    None => return Some(UndefinedItemLengthSnafu.fail()),
                 };
 
-                self.last_header = None;
-
-                // sequences can end after this token
-                self.delimiter_check_pending = true;
-
-                Some(Ok(DataToken::PrimitiveValue(value)))
-            }
-        } else {
-            // a data element header or item delimiter is expected
-            match self.parser.decode_header() {
-                Ok(DataElementHeader {
-                    tag,
-                    vr: VR::SQ,
-                    len,
-                }) => {
-                    let len = match self.sanitize_length(len) {
-                        Some(len) => len,
-                        None => {
-                            return Some(
-                                InvalidElementLengthSnafu {
-                                    tag,
-                                    len: len.0,
-                                    bytes_read: self.parser.position(),
-                                }
-                                .fail(),
-                            )
-                        }
-                    };
-
-                    self.in_sequence = true;
-                    self.push_sequence_token(SeqTokenType::Sequence, len, false);
-
-                    // sequences can end right after they start
-                    if len == Length(0) {
-                        self.delimiter_check_pending = true;
+                if self.offset_table_next {
+                    // offset table
+                    let mut offset_table = Vec::new();
+                    let res = offset_table
+                        .try_reserve_exact(len)
+                        .context(AllocateOffsetTableSnafu { len: len as u32 });
+                    if let Err(e) = res {
+                        return Some(Err(e));
                     }
 
-                    Some(Ok(DataToken::SequenceStart { tag, len }))
-                }
-                Ok(DataElementHeader {
-                    tag: Tag(0xFFFE, 0xE00D),
-                    ..
-                }) if self.seq_delimiters.is_empty() => {
-                    // ignore delimiter, we are not in a sequence
-                    tracing::warn!(
-                        "Item delimitation item outside of a sequence in position {}",
-                        self.parser.position()
-                    );
-                    // return a new token by calling the method again
-                    self.next()
-                }
-                Ok(DataElementHeader {
-                    tag: Tag(0xFFFE, 0xE00D),
-                    ..
-                }) => {
-                    self.in_sequence = true;
-                    // pop item delimiter
-                    self.seq_delimiters.pop();
-                    // sequences can end after this token
+                    self.offset_table_next = false;
+
+                    // need to pop item delimiter on the next iteration
                     self.delimiter_check_pending = true;
-                    Some(Ok(DataToken::ItemEnd))
-                }
-                Ok(header) if header.is_encapsulated_pixeldata() => {
-                    // encapsulated pixel data conditions:
-                    // expect a sequence of pixel data fragments
 
-                    // save it for the next step
-                    self.last_header = Some(header);
-                    Some(Ok(DataToken::PixelSequenceStart))
-                }
-                Ok(header) if header.len.is_undefined() => {
-                    // treat other undefined length elements
-                    // as data set sequences,
-                    // discarding the VR in the process
-                    self.in_sequence = true;
+                    Some(
+                        match self.parser.read_u32_to_vec(len as u32, &mut offset_table) {
+                            Ok(()) => Ok(DataToken::OffsetTable(offset_table)),
+                            Err(e) => Err(e).context(ReadItemValueSnafu { len: len as u32 }),
+                        },
+                    )
+                } else {
+                    // item value
+                    let mut value = Vec::new();
+                    let res = value
+                        .try_reserve_exact(len)
+                        .context(AllocateItemSnafu { len: len as u32 });
+                    if let Err(e) = res {
+                        return Some(Err(e));
+                    }
 
-                    let DataElementHeader { tag, len, .. } = header;
-                    self.push_sequence_token(SeqTokenType::Sequence, len, false);
-
-                    Some(Ok(DataToken::SequenceStart { tag, len }))
+                    // need to pop item delimiter on the next iteration
+                    self.delimiter_check_pending = true;
+                    Some(
+                        self.parser
+                            .read_to_vec(len as u32, &mut value)
+                            .map(|_| Ok(DataToken::ItemValue(value)))
+                            .unwrap_or_else(|e| {
+                                Err(e).context(ReadItemValueSnafu { len: len as u32 })
+                            }),
+                    )
                 }
-                Ok(mut header) => {
-                    match self.sanitize_length(header.len) {
-                        Some(len) => header.len = len,
-                        None => {
-                            return Some(
-                                InvalidElementLengthSnafu {
-                                    tag: header.tag,
-                                    len: header.len.0,
-                                    bytes_read: self.parser.position(),
+            } else if let Some(header) = self.last_header {
+                if header.is_encapsulated_pixeldata() {
+                    self.push_sequence_token(SeqTokenType::Sequence, Length::UNDEFINED, true);
+                    self.last_header = None;
+
+                    // encapsulated pixel data, expecting offset table
+                    match self.parser.decode_item_header() {
+                        Ok(header) => match header {
+                            SequenceItemHeader::Item { len } => {
+                                let len = match self.sanitize_length(len) {
+                                    Some(len) => len,
+                                    None => {
+                                        return Some(
+                                            InvalidItemLengthSnafu {
+                                                bytes_read: self.parser.position(),
+                                                len: len.0,
+                                            }
+                                            .fail(),
+                                        );
+                                    }
+                                };
+
+                                // entered a new item
+                                self.in_sequence = false;
+                                self.push_sequence_token(SeqTokenType::Item, len, true);
+                                // items can be empty
+                                if len == Length(0) {
+                                    self.delimiter_check_pending = true;
+                                } else {
+                                    self.offset_table_next = true;
                                 }
-                                .fail(),
-                            )
+                                Some(Ok(DataToken::ItemStart { len }))
+                            }
+                            SequenceItemHeader::SequenceDelimiter => {
+                                // empty pixel data
+                                self.seq_delimiters.pop();
+                                self.in_sequence = false;
+                                Some(Ok(DataToken::SequenceEnd))
+                            }
+                            item => {
+                                self.hard_break = true;
+                                Some(UnexpectedItemTagSnafu { tag: item.tag() }.fail())
+                            }
+                        },
+                        Err(e) => {
+                            self.hard_break = true;
+                            Some(Err(e).context(ReadItemHeaderSnafu))
+                        }
+                    }
+                } else {
+                    // a plain element header was read, so a value is expected
+                    let value = match self.read_value(&header) {
+                        Ok(v) => v,
+                        Err(e) => {
+                            self.hard_break = true;
+                            self.last_header = None;
+                            return Some(Err(e));
                         }
                     };
 
-                    // save it for the next step
-                    self.last_header = Some(header);
-                    Some(Ok(DataToken::ElementHeader(header)))
+                    self.last_header = None;
+
+                    // sequences can end after this token
+                    self.delimiter_check_pending = true;
+
+                    Some(Ok(DataToken::PrimitiveValue(value)))
                 }
-                Err(DecoderError::DecodeElementHeader {
-                    source: dicom_encoding::decode::Error::ReadHeaderTag { source, .. },
-                    ..
-                }) if source.kind() == std::io::ErrorKind::UnexpectedEof => {
-                    // Note: if `UnexpectedEof` was reached while trying to read
-                    // an element tag, then we assume that
-                    // the end of a DICOM object was reached gracefully.
-                    // This approach is unlikely to consume trailing bytes,
-                    // but may ignore the current depth of the data set tree.
-                    self.hard_break = true;
-                    None
+            } else {
+                // a data element header or item delimiter is expected
+                match self.parser.decode_header() {
+                    Ok(DataElementHeader {
+                        tag,
+                        vr: VR::SQ,
+                        len,
+                    }) => {
+                        let len = match self.sanitize_length(len) {
+                            Some(len) => len,
+                            None => {
+                                return Some(
+                                    InvalidElementLengthSnafu {
+                                        tag,
+                                        len: len.0,
+                                        bytes_read: self.parser.position(),
+                                    }
+                                    .fail(),
+                                );
+                            }
+                        };
+
+                        self.in_sequence = true;
+                        self.push_sequence_token(SeqTokenType::Sequence, len, false);
+
+                        // sequences can end right after they start
+                        if len == Length(0) {
+                            self.delimiter_check_pending = true;
+                        }
+
+                        Some(Ok(DataToken::SequenceStart { tag, len }))
+                    }
+                    Ok(DataElementHeader {
+                        tag: Tag(0xFFFE, 0xE00D),
+                        ..
+                    }) if self.seq_delimiters.is_empty() => {
+                        // ignore delimiter, we are not in a sequence
+                        tracing::warn!(
+                            "Item delimitation item outside of a sequence in position {}",
+                            self.parser.position()
+                        );
+                        // return a new token by repeating the method again
+                        continue;
+                    }
+                    Ok(DataElementHeader {
+                        tag: Tag(0xFFFE, 0xE00D),
+                        ..
+                    }) => {
+                        self.in_sequence = true;
+                        // pop item delimiter
+                        self.seq_delimiters.pop();
+                        // sequences can end after this token
+                        self.delimiter_check_pending = true;
+                        Some(Ok(DataToken::ItemEnd))
+                    }
+                    Ok(header) if header.is_encapsulated_pixeldata() => {
+                        // encapsulated pixel data conditions:
+                        // expect a sequence of pixel data fragments
+
+                        // save it for the next step
+                        self.last_header = Some(header);
+                        Some(Ok(DataToken::PixelSequenceStart))
+                    }
+                    Ok(header) if header.len.is_undefined() => {
+                        // treat other undefined length elements
+                        // as data set sequences,
+                        // discarding the VR in the process
+                        self.in_sequence = true;
+
+                        let DataElementHeader { tag, len, .. } = header;
+                        self.push_sequence_token(SeqTokenType::Sequence, len, false);
+
+                        Some(Ok(DataToken::SequenceStart { tag, len }))
+                    }
+                    Ok(mut header) => {
+                        match self.sanitize_length(header.len) {
+                            Some(len) => header.len = len,
+                            None => {
+                                return Some(
+                                    InvalidElementLengthSnafu {
+                                        tag: header.tag,
+                                        len: header.len.0,
+                                        bytes_read: self.parser.position(),
+                                    }
+                                    .fail(),
+                                );
+                            }
+                        };
+
+                        // save it for the next step
+                        self.last_header = Some(header);
+                        Some(Ok(DataToken::ElementHeader(header)))
+                    }
+                    Err(DecoderError::DecodeElementHeader {
+                        source: dicom_encoding::decode::Error::ReadHeaderTag { source, .. },
+                        ..
+                    }) if source.kind() == std::io::ErrorKind::UnexpectedEof => {
+                        // Note: if `UnexpectedEof` was reached while trying to read
+                        // an element tag, then we assume that
+                        // the end of a DICOM object was reached gracefully.
+                        // This approach is unlikely to consume trailing bytes,
+                        // but may ignore the current depth of the data set tree.
+                        self.hard_break = true;
+                        None
+                    }
+                    Err(e) => {
+                        self.hard_break = true;
+                        Some(Err(e).context(ReadHeaderSnafu))
+                    }
                 }
-                Err(e) => {
-                    self.hard_break = true;
-                    Some(Err(e).context(ReadHeaderSnafu))
-                }
-            }
+            };
         }
     }
 }
@@ -644,17 +711,16 @@ where
                 match end_of_sequence.cmp(&bytes_read) {
                     Ordering::Equal => {
                         // end of delimiter, as indicated by the element's length
-                        let token;
-                        match sd.typ {
+                        let token = match sd.typ {
                             SeqTokenType::Sequence => {
                                 self.in_sequence = false;
-                                token = DataToken::SequenceEnd;
+                                DataToken::SequenceEnd
                             }
                             SeqTokenType::Item => {
                                 self.in_sequence = true;
-                                token = DataToken::ItemEnd;
+                                DataToken::ItemEnd
                             }
-                        }
+                        };
                         self.seq_delimiters.pop();
                         return Ok(Some(token));
                     }

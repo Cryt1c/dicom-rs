@@ -41,9 +41,11 @@ use dicom_core::ops::{
 };
 use dicom_encoding::Codec;
 use dicom_parser::dataset::read::{DataSetReaderOptions, OddLengthStrategy};
+use dicom_parser::dataset::write::DataSetWriterOptions;
+use dicom_parser::stateful::decode::CharacterSetOverride;
 use itertools::Itertools;
 use smallvec::SmallVec;
-use snafu::{ensure, OptionExt, ResultExt};
+use snafu::{OptionExt, ResultExt, ensure};
 use std::borrow::Cow;
 use std::fs::File;
 use std::io::{BufRead, BufReader, Read};
@@ -54,7 +56,6 @@ use crate::file::ReadPreamble;
 use crate::ops::{
     ApplyError, ApplyResult, IncompatibleTypesSnafu, ModifySnafu, UnsupportedActionSnafu,
 };
-use crate::{meta::FileMetaTable, FileMetaTableBuilder};
 use crate::{
     AccessByNameError, AccessError, AtAccessError, BuildMetaTableSnafu, CreateParserSnafu,
     CreatePrinterSnafu, DicomObject, ElementNotFoundSnafu, FileDicomObject, InvalidGroupSnafu,
@@ -66,17 +67,18 @@ use crate::{
     ReadUnsupportedTransferSyntaxSnafu, ReadUnsupportedTransferSyntaxWithSuggestionSnafu,
     UnexpectedTokenSnafu, WithMetaError, WriteError,
 };
+use crate::{FileMetaTableBuilder, meta::FileMetaTable};
 use dicom_core::dictionary::{DataDictionary, DataDictionaryEntry};
 use dicom_core::header::{GroupNumber, HasLength, Header};
-use dicom_core::value::{DataSetSequence, PixelFragmentSequence, Value, ValueType, C};
+use dicom_core::value::{C, DataSetSequence, PixelFragmentSequence, Value, ValueType};
 use dicom_core::{DataElement, Length, PrimitiveValue, Tag, VR};
-use dicom_dictionary_std::{tags, uids, StandardDataDictionary};
+use dicom_dictionary_std::{StandardDataDictionary, tags, uids};
 use dicom_encoding::transfer_syntax::TransferSyntaxIndex;
-use dicom_encoding::{encode::EncodeTo, text::SpecificCharacterSet, TransferSyntax};
+use dicom_encoding::{TransferSyntax, encode::EncodeTo, text::SpecificCharacterSet};
 use dicom_parser::dataset::{DataSetReader, DataToken, IntoTokensOptions};
 use dicom_parser::{
-    dataset::{read::Error as ParserError, DataSetWriter, IntoTokens},
     StatefulDecode,
+    dataset::{DataSetWriter, IntoTokens, read::Error as ParserError},
 };
 use dicom_transfer_syntax_registry::TransferSyntaxRegistry;
 
@@ -123,22 +125,113 @@ impl<D> HasLength for InMemDicomObject<D> {
     }
 }
 
+impl<D> HasLength for &InMemDicomObject<D> {
+    fn length(&self) -> Length {
+        self.len
+    }
+}
+
+impl<D> DicomObject for InMemDicomObject<D>
+where
+    D: DataDictionary,
+    D: Clone,
+{
+    type Attribute<'a>
+        = &'a Value<InMemDicomObject<D>, InMemFragment>
+    where
+        Self: 'a;
+
+    type LeafAttribute<'a>
+        = &'a Value<InMemDicomObject<D>, InMemFragment>
+    where
+        Self: 'a;
+
+    #[inline]
+    fn attr_opt(&self, tag: Tag) -> Result<Option<Self::Attribute<'_>>> {
+        let elem = InMemDicomObject::element_opt(self, tag)?;
+        Ok(elem.map(|e| e.value()))
+    }
+
+    #[inline]
+    fn attr_by_name_opt(
+        &self,
+        name: &str,
+    ) -> Result<Option<Self::Attribute<'_>>, AccessByNameError> {
+        let elem = InMemDicomObject::element_by_name_opt(self, name)?;
+        Ok(elem.map(|e| e.value()))
+    }
+
+    #[inline]
+    fn attr(&self, tag: Tag) -> Result<Self::Attribute<'_>> {
+        let elem = InMemDicomObject::element(self, tag)?;
+        Ok(elem.value())
+    }
+
+    #[inline]
+    fn attr_by_name(&self, name: &str) -> Result<Self::Attribute<'_>, AccessByNameError> {
+        let elem = InMemDicomObject::element_by_name(self, name)?;
+        Ok(elem.value())
+    }
+
+    #[inline]
+    fn at(
+        &self,
+        selector: impl Into<AttributeSelector>,
+    ) -> Result<Self::LeafAttribute<'_>, AtAccessError> {
+        self.value_at(selector)
+    }
+}
+
 impl<'s, D: 's> DicomObject for &'s InMemDicomObject<D>
 where
     D: DataDictionary,
     D: Clone,
 {
-    type Element = &'s InMemElement<D>;
+    type Attribute<'a>
+        = &'a Value<InMemDicomObject<D>, InMemFragment>
+    where
+        Self: 'a,
+        's: 'a;
 
-    fn element(&self, tag: Tag) -> Result<Self::Element> {
-        self.entries
-            .get(&tag)
-            .context(NoSuchDataElementTagSnafu { tag })
+    type LeafAttribute<'a>
+        = &'a Value<InMemDicomObject<D>, InMemFragment>
+    where
+        Self: 'a,
+        's: 'a;
+
+    #[inline]
+    fn attr_opt(&self, tag: Tag) -> Result<Option<Self::Attribute<'_>>> {
+        let elem = InMemDicomObject::element_opt(*self, tag)?;
+        Ok(elem.map(|e| e.value()))
     }
 
-    fn element_by_name(&self, name: &str) -> Result<Self::Element, AccessByNameError> {
-        let tag = self.lookup_name(name)?;
-        self.element(tag).map_err(|e| e.into_access_by_name(name))
+    #[inline]
+    fn attr_by_name_opt(
+        &self,
+        name: &str,
+    ) -> Result<Option<Self::Attribute<'_>>, AccessByNameError> {
+        let elem = InMemDicomObject::element_by_name_opt(*self, name)?;
+        Ok(elem.map(|e| e.value()))
+    }
+
+    #[inline]
+    fn attr(&self, tag: Tag) -> Result<Self::Attribute<'_>> {
+        let elem = InMemDicomObject::element(*self, tag)?;
+        Ok(elem.value())
+    }
+
+    #[inline]
+    fn attr_by_name(&self, name: &str) -> Result<Self::Attribute<'_>, AccessByNameError> {
+        let elem = InMemDicomObject::element_by_name(*self, name)?;
+        Ok(elem.value())
+    }
+
+    #[inline]
+    fn at(
+        &self,
+        selector: impl Into<AttributeSelector>,
+    ) -> Result<Self::LeafAttribute<'_>, AtAccessError> {
+        self.value_at(selector)
     }
 }
 
@@ -317,18 +410,23 @@ where
             dict,
             ts_index,
             None,
+            None,
             ReadPreamble::Auto,
+            Default::default(),
             Default::default(),
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn open_file_with_all_options<P, R>(
         path: P,
         dict: D,
         ts_index: R,
         read_until: Option<Tag>,
+        read_to: Option<Tag>,
         mut read_preamble: ReadPreamble,
         odd_length: OddLengthStrategy,
+        charset_override: CharacterSetOverride,
     ) -> Result<Self, ReadError>
     where
         P: AsRef<Path>,
@@ -350,7 +448,15 @@ where
                 .with_context(|_| ReadFileSnafu { filename: path })?;
         }
 
-        Self::read_parts_with_all_options_impl(file, dict, ts_index, read_until, odd_length)
+        Self::read_parts_with_all_options_impl(
+            file,
+            dict,
+            ts_index,
+            read_until,
+            read_to,
+            odd_length,
+            charset_override,
+        )
     }
 
     /// Create a DICOM object by reading from a byte source.
@@ -390,18 +496,23 @@ where
             dict,
             ts_index,
             None,
+            None,
             ReadPreamble::Auto,
+            Default::default(),
             Default::default(),
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn from_reader_with_all_options<S, R>(
         src: S,
         dict: D,
         ts_index: R,
         read_until: Option<Tag>,
+        read_to: Option<Tag>,
         mut read_preamble: ReadPreamble,
         odd_length: OddLengthStrategy,
+        charset_override: CharacterSetOverride,
     ) -> Result<Self, ReadError>
     where
         S: Read,
@@ -420,7 +531,15 @@ where
             file.read_exact(&mut buf).context(ReadPreambleBytesSnafu)?;
         }
 
-        Self::read_parts_with_all_options_impl(file, dict, ts_index, read_until, odd_length)
+        Self::read_parts_with_all_options_impl(
+            file,
+            dict,
+            ts_index,
+            read_until,
+            read_to,
+            odd_length,
+            charset_override,
+        )
     }
 
     // detect the presence of a preamble
@@ -460,7 +579,9 @@ where
         dict: D,
         ts_index: R,
         read_until: Option<Tag>,
+        read_to: Option<Tag>,
         odd_length: OddLengthStrategy,
+        charset_override: CharacterSetOverride,
     ) -> Result<Self, ReadError>
     where
         S: Read,
@@ -474,6 +595,7 @@ where
         if let Some(ts) = ts_index.get(ts_uid) {
             let mut options = DataSetReaderOptions::default();
             options.odd_length = odd_length;
+            options.charset_override = charset_override;
 
             let obj = match ts.codec() {
                 Codec::Dataset(Some(adapter)) => {
@@ -486,6 +608,7 @@ where
                         false,
                         Length::UNDEFINED,
                         read_until,
+                        read_to,
                     )?
                 }
                 Codec::Dataset(None) => {
@@ -516,6 +639,7 @@ where
                         false,
                         Length::UNDEFINED,
                         read_until,
+                        read_to,
                     )?
                 }
             };
@@ -656,7 +780,7 @@ where
         D: DataDictionary,
     {
         let mut dataset = DataSetReader::new(decoder, Default::default());
-        InMemDicomObject::build_object(&mut dataset, dict, false, Length::UNDEFINED, None)
+        InMemDicomObject::build_object(&mut dataset, dict, false, Length::UNDEFINED, None, None)
     }
 
     /// Read an object from a source,
@@ -698,7 +822,14 @@ where
                 let adapter = adapter.adapt_reader(Box::new(from));
                 let mut dataset =
                     DataSetReader::new_with_ts_cs(adapter, ts, cs).context(CreateParserSnafu)?;
-                InMemDicomObject::build_object(&mut dataset, dict, false, Length::UNDEFINED, None)
+                InMemDicomObject::build_object(
+                    &mut dataset,
+                    dict,
+                    false,
+                    Length::UNDEFINED,
+                    None,
+                    None,
+                )
             }
             Codec::Dataset(None) => {
                 let uid = ts.uid();
@@ -723,7 +854,14 @@ where
             Codec::None | Codec::EncapsulatedPixelData(..) => {
                 let mut dataset =
                     DataSetReader::new_with_ts_cs(from, ts, cs).context(CreateParserSnafu)?;
-                InMemDicomObject::build_object(&mut dataset, dict, false, Length::UNDEFINED, None)
+                InMemDicomObject::build_object(
+                    &mut dataset,
+                    dict,
+                    false,
+                    Length::UNDEFINED,
+                    None,
+                    None,
+                )
             }
         }
     }
@@ -846,7 +984,7 @@ where
     ///         VR::LO,
     ///         PrimitiveValue::from("CREATOR 1"),
     ///     ),
-    ///     DataElement::new(Tag(0x0009, 0x01001), VR::DS, "1.0"),
+    ///     DataElement::new(Tag(0x0009, 0x1001), VR::DS, "1.0"),
     /// ]);
     /// assert_eq!(
     ///     ds.private_element(0x0009, "CREATOR 1", 0x01)?
@@ -1001,11 +1139,10 @@ where
     /// reporting whether it was present.
     pub fn remove_element_by_name(&mut self, name: &str) -> Result<bool, AccessByNameError> {
         let tag = self.lookup_name(name)?;
-        Ok(self.entries.remove(&tag).is_some()).map(|removed| {
-            if removed {
+        Ok(self.entries.remove(&tag).is_some()).inspect(|removed| {
+            if *removed {
                 self.len = Length::UNDEFINED;
             }
-            removed
         })
     }
 
@@ -1013,9 +1150,8 @@ where
     pub fn take_element(&mut self, tag: Tag) -> Result<InMemElement<D>> {
         self.entries
             .remove(&tag)
-            .map(|e| {
+            .inspect(|_e| {
                 self.len = Length::UNDEFINED;
-                e
             })
             .context(NoSuchDataElementTagSnafu { tag })
     }
@@ -1024,9 +1160,8 @@ where
     /// if it is present,
     /// returns `None` otherwise.
     pub fn take(&mut self, tag: Tag) -> Option<InMemElement<D>> {
-        self.entries.remove(&tag).map(|e| {
+        self.entries.remove(&tag).inspect(|_e| {
             self.len = Length::UNDEFINED;
-            e
         })
     }
 
@@ -1038,9 +1173,8 @@ where
         let tag = self.lookup_name(name)?;
         self.entries
             .remove(&tag)
-            .map(|e| {
+            .inspect(|_e| {
                 self.len = Length::UNDEFINED;
-                e
             })
             .with_context(|| NoSuchDataElementAliasSnafu {
                 tag,
@@ -1265,7 +1399,7 @@ where
                 AttributeSelectorStep::Tag(tag) => {
                     return obj.get(*tag).with_context(|| MissingLeafElementSnafu {
                         selector: selector.clone(),
-                    })
+                    });
                 }
                 // navigate further down
                 AttributeSelectorStep::Nested { tag, item } => {
@@ -1314,7 +1448,7 @@ where
                 AttributeSelectorStep::Tag(tag) => {
                     return obj.get_mut(*tag).with_context(|| MissingLeafElementSnafu {
                         selector: selector.clone(),
-                    })
+                    });
                 }
                 // navigate further down
                 AttributeSelectorStep::Nested { tag, item } => {
@@ -1805,6 +1939,8 @@ where
     /// until _Specific Character Set_ is found in the data set,
     /// in which then that character set will be used.
     ///
+    /// Uses the default [DataSetWriterOptions] for the writer.
+    ///
     /// Note: [`write_dataset_with_ts`] and [`write_dataset_with_ts_cs`]
     /// may be easier to use and _will_ apply a dataset adapter (such as
     /// DeflatedExplicitVRLittleEndian (1.2.840.10008.1.2.99)) whereas this
@@ -1831,6 +1967,9 @@ where
     /// Write this object's data set into the given printer,
     /// with the specified transfer syntax and character set,
     /// without preamble, magic code, nor file meta group.
+    ///
+    /// The default [DataSetWriterOptions] is used for the writer. To change
+    /// that, use [`write_dataset_with_ts_cs_options`](Self::write_dataset_with_ts_cs_options).
     ///
     /// If the attribute _Specific Character Set_ is found in the data set,
     /// the last parameter is overridden accordingly.
@@ -1870,9 +2009,42 @@ where
         }
     }
 
+    /// Write this object's data set into the given printer,
+    /// with the specified transfer syntax and character set,
+    /// without preamble, magic code, nor file meta group.
+    ///
+    /// If the attribute _Specific Character Set_ is found in the data set,
+    /// the last parameter is overridden accordingly.
+    /// See also [`write_dataset_with_ts`](Self::write_dataset_with_ts).
+    pub fn write_dataset_with_ts_cs_options<W>(
+        &self,
+        to: W,
+        ts: &TransferSyntax,
+        cs: SpecificCharacterSet,
+        options: DataSetWriterOptions,
+    ) -> Result<(), WriteError>
+    where
+        W: Write,
+    {
+        // prepare data set writer
+        let mut dset_writer =
+            DataSetWriter::with_ts_cs_options(to, ts, cs, options).context(CreatePrinterSnafu)?;
+        let required_options = IntoTokensOptions::new(self.charset_changed);
+
+        // write object
+        dset_writer
+            .write_sequence(self.into_tokens_with_options(required_options))
+            .context(PrintDataSetSnafu)?;
+
+        Ok(())
+    }
+
     /// Write this object's data set into the given writer,
     /// with the specified transfer syntax,
     /// without preamble, magic code, nor file meta group.
+    ///
+    /// The default [DataSetWriterOptions] is used for the writer. To change
+    /// that, use [`write_dataset_with_ts_options`](Self::write_dataset_with_ts_options).
     ///
     /// The default character set is assumed
     /// until the _Specific Character Set_ is found in the data set,
@@ -1882,6 +2054,25 @@ where
         W: Write,
     {
         self.write_dataset_with_ts_cs(to, ts, SpecificCharacterSet::default())
+    }
+
+    /// Write this object's data set into the given writer,
+    /// with the specified transfer syntax,
+    /// without preamble, magic code, nor file meta group.
+    ///
+    /// The default character set is assumed
+    /// until the _Specific Character Set_ is found in the data set,
+    /// after which the text encoder is overridden accordingly.
+    pub fn write_dataset_with_ts_options<W>(
+        &self,
+        to: W,
+        ts: &TransferSyntax,
+        options: DataSetWriterOptions,
+    ) -> Result<(), WriteError>
+    where
+        W: Write,
+    {
+        self.write_dataset_with_ts_cs_options(to, ts, SpecificCharacterSet::default(), options)
     }
 
     /// Encapsulate this object to contain a file meta group
@@ -1966,6 +2157,7 @@ where
         in_item: bool,
         len: Length,
         read_until: Option<Tag>,
+        read_to: Option<Tag>,
     ) -> Result<Self, ReadError>
     where
         I: ?Sized + Iterator<Item = ParserResult<DataToken>>,
@@ -1975,19 +2167,25 @@ where
         while let Some(token) = dataset.next() {
             let elem = match token.context(ReadTokenSnafu)? {
                 DataToken::PixelSequenceStart => {
-                    // stop reading if reached `read_until` tag
-                    if read_until
-                        .map(|t| t <= Tag(0x7fe0, 0x0010))
-                        .unwrap_or(false)
-                    {
+                    let sq_start_tag = Tag(0x7fe0, 0x0010);
+                    // stop reading if reached `read_until` tag (exclusive)
+                    if read_until.map(|t| t <= sq_start_tag).unwrap_or(false) {
+                        break;
+                    }
+                    // stop reading if exceeded `read_to` tag (inclusive)
+                    if read_to.map(|t| t < sq_start_tag).unwrap_or(false) {
                         break;
                     }
                     let value = InMemDicomObject::build_encapsulated_data(&mut *dataset)?;
-                    DataElement::new(Tag(0x7fe0, 0x0010), VR::OB, value)
+                    DataElement::new(sq_start_tag, VR::OB, value)
                 }
                 DataToken::ElementHeader(header) => {
-                    // stop reading if reached `read_until` tag
+                    // stop reading if reached `read_until` tag (exclusive)
                     if read_until.map(|t| t <= header.tag).unwrap_or(false) {
+                        break;
+                    }
+                    // stop reading if exceeded `read_to` tag (inclusive)
+                    if read_to.map(|t| t < header.tag).unwrap_or(false) {
                         break;
                     }
 
@@ -2006,8 +2204,12 @@ where
                     }
                 }
                 DataToken::SequenceStart { tag, len } => {
-                    // stop reading if reached `read_until` tag
+                    // stop reading if reached `read_until` tag (exclusive)
                     if read_until.map(|t| t <= tag).unwrap_or(false) {
+                        break;
+                    }
+                    // stop reading if exceeded `read_to` tag (inclusive)
+                    if read_to.map(|t| t < tag).unwrap_or(false) {
                         break;
                     }
 
@@ -2032,28 +2234,6 @@ where
                 token => return UnexpectedTokenSnafu { token }.fail(),
             };
 
-            // if tags::DIRECTORY_RECORD_SEQUENCE == elem.tag() {
-            //     println!("asdf tag {:?}", elem.tag());
-            // }
-                println!("asdf tag {:?}", elem.tag());
-            if let Ok(value) = elem.uint32() {
-                if value == 396 {
-                    println!("asdf tag {:?}", elem.tag());
-                    println!("asdf {:?}", value);
-                }
-            }
-            if let Ok(value) = elem.uint32() {
-                if value == 52 {
-                    println!("asdf tag {:?}", elem.tag());
-                    println!("asdf {:?}", value);
-                }
-            }
-            if let Ok(value) = elem.uint32() {
-                if value == 3126 {
-                    println!("asdf tag {:?}", elem.tag());
-                    println!("asdf {:?}", value);
-                }
-            }
             entries.insert(elem.tag(), elem);
         }
 
@@ -2137,6 +2317,7 @@ where
                         dict.clone(),
                         true,
                         len,
+                        None,
                         None,
                     )?);
                 }
@@ -2231,14 +2412,14 @@ fn even_len(l: u32) -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::open_file;
+    use crate::{DicomAttribute as _, open_file};
     use byteordered::Endianness;
     use dicom_core::chrono::FixedOffset;
     use dicom_core::value::{DicomDate, DicomDateTime, DicomTime};
     use dicom_core::{dicom_value, header::DataElementHeader};
     use dicom_encoding::{
         decode::{basic::BasicDecoder, implicit_le::ImplicitVRLittleEndianDecoder},
-        encode::{implicit_le::ImplicitVRLittleEndianEncoder, EncoderFor},
+        encode::{EncoderFor, implicit_le::ImplicitVRLittleEndianEncoder},
     };
     use dicom_parser::StatefulDecoder;
 
@@ -2401,6 +2582,61 @@ mod tests {
                 b'P', b'N', // VR: PN
                 0x08, 0x00, // Length: 8
                 b'D', b'o', b'e', b'^', b'J', b'o', b'h', b'n',
+            ][..],
+        );
+    }
+
+    #[test]
+    fn inmem_object_write_dataset_encapsulated_pixel_data() {
+        let mut obj = InMemDicomObject::new_empty();
+
+        let sop_instance_uid = DataElement::new(
+            tags::SOP_INSTANCE_UID,
+            VR::UI,
+            "2.25.44399302050596340528032699331187776010",
+        );
+        obj.put(sop_instance_uid);
+
+        obj.put(DataElement::new(
+            tags::PIXEL_DATA,
+            VR::OB,
+            PixelFragmentSequence::new_fragments([
+                vec![0x01, 0x02, 0x03, 0x04],
+                vec![0x05, 0x06, 0x07, 0x08],
+            ]),
+        ));
+
+        let mut out = Vec::new();
+
+        let ts = TransferSyntaxRegistry
+            .get(uids::ENCAPSULATED_UNCOMPRESSED_EXPLICIT_VR_LITTLE_ENDIAN)
+            .unwrap();
+
+        obj.write_dataset_with_ts(&mut out, ts).unwrap();
+
+        assert_eq!(
+            out,
+            &[
+                0x08, 0x00, 0x18, 0x00, // Tag(0x0008, 0x0018)
+                b'U', b'I', // VR: UI
+                0x2c, 0x00, // Length: 44
+                // 2.25.44399302050596340528032699331187776010
+                b'2', b'.', b'2', b'5', b'.', b'4', b'4', b'3', b'9', b'9', b'3', b'0', b'2', b'0',
+                b'5', b'0', b'5', b'9', b'6', b'3', b'4', b'0', b'5', b'2', b'8', b'0', b'3', b'2',
+                b'6', b'9', b'9', b'3', b'3', b'1', b'1', b'8', b'7', b'7', b'7', b'6', b'0', b'1',
+                b'0', b'\0', // pixel data
+                0xe0, 0x7f, 0x10, 0x00, // Tag(0x7fe0, 0x0010)
+                b'O', b'B', // VR: OB
+                0x00, 0x00, // reserved
+                0xff, 0xff, 0xff, 0xff, // Length: undefined
+                // first fragment (offset table)
+                0xfe, 0xff, 0x00, 0xe0, 0x00, 0x00, 0x00, 0x00, // Length: 0
+                // second fragment
+                0xfe, 0xff, 0x00, 0xe0, 0x04, 0x00, 0x00, 0x00, // Length: 4
+                0x01, 0x02, 0x03, 0x04, // third fragment
+                0xfe, 0xff, 0x00, 0xe0, 0x04, 0x00, 0x00, 0x00, // Length: 4
+                0x05, 0x06, 0x07, 0x08, // sequence delimitation item
+                0xfe, 0xff, 0xdd, 0xe0, 0x00, 0x00, 0x00, 0x00, // Length: 0
             ][..],
         );
     }
@@ -2894,6 +3130,7 @@ mod tests {
             false,
             Length::UNDEFINED,
             None,
+            None,
         )
         .unwrap();
 
@@ -3010,6 +3247,7 @@ mod tests {
             false,
             Length::UNDEFINED,
             None,
+            None,
         )
         .unwrap();
 
@@ -3118,6 +3356,7 @@ mod tests {
             false,
             Length::UNDEFINED,
             None,
+            None,
         )
         .unwrap();
 
@@ -3151,6 +3390,34 @@ mod tests {
                 DataToken::SequenceEnd,
             ]
         );
+    }
+
+    /// Test that a DICOM object can be reliably used
+    /// behind the `DicomObject` trait.
+    #[test]
+    fn can_use_behind_trait() {
+        fn dicom_dataset() -> impl DicomObject {
+            InMemDicomObject::from_element_iter([DataElement::new(
+                tags::PATIENT_NAME,
+                VR::PN,
+                PrimitiveValue::Str("Doe^John".to_string()),
+            )])
+        }
+
+        let obj = dicom_dataset();
+        let elem1 = obj
+            .attr_by_name_opt("PatientName")
+            .unwrap()
+            .expect("PatientName should be present");
+        assert_eq!(
+            &elem1
+                .to_str()
+                .expect("should be able to retrieve patient name as string"),
+            "Doe^John"
+        );
+
+        // try a missing element, should return None
+        assert!(obj.attr_opt(tags::PATIENT_ID).unwrap().is_none());
     }
 
     /// Test attribute operations on in-memory DICOM objects.
@@ -3521,7 +3788,20 @@ mod tests {
                 ))
                 .unwrap(),
                 &PrimitiveValue::from(1_u16).into(),
-            )
+            );
+
+            // same result when using `DicomObject::at`
+            assert_eq!(
+                DicomObject::at(
+                    &obj,
+                    (
+                        tags::SEQUENCE_OF_ULTRASOUND_REGIONS,
+                        tags::REGION_SPATIAL_FORMAT
+                    )
+                )
+                .unwrap(),
+                &PrimitiveValue::from(1_u16).into(),
+            );
         }
     }
 
@@ -3880,11 +4160,12 @@ mod tests {
         });
         assert!(o);
 
-        assert!(obj
-            .get(tags::ANATOMIC_REGION_SEQUENCE)
-            .unwrap()
-            .length()
-            .is_undefined());
+        assert!(
+            obj.get(tags::ANATOMIC_REGION_SEQUENCE)
+                .unwrap()
+                .length()
+                .is_undefined()
+        );
     }
 
     #[test]
@@ -4101,5 +4382,131 @@ mod tests {
             res.err().unwrap().to_string(),
             "No space available in group 0x0009"
         );
+    }
+
+    /// Helper to build the token stream used in read_to/read_until sequence tests:
+    /// - (0018,6011) SQ  (sequence with two items)
+    /// - (0020,4000) LT  "TEST"
+    fn tokens_with_sequence() -> Vec<DataToken> {
+        vec![
+            DataToken::SequenceStart {
+                tag: Tag(0x0018, 0x6011),
+                len: Length::UNDEFINED,
+            },
+            DataToken::ItemStart {
+                len: Length::UNDEFINED,
+            },
+            DataToken::ElementHeader(DataElementHeader {
+                tag: Tag(0x0018, 0x6012),
+                vr: VR::US,
+                len: Length(2),
+            }),
+            DataToken::PrimitiveValue(PrimitiveValue::U16([1].as_ref().into())),
+            DataToken::ItemEnd,
+            DataToken::SequenceEnd,
+            DataToken::ElementHeader(DataElementHeader {
+                tag: Tag(0x0020, 0x4000),
+                vr: VR::LT,
+                len: Length(4),
+            }),
+            DataToken::PrimitiveValue(PrimitiveValue::Str("TEST".into())),
+        ]
+    }
+
+    #[test]
+    fn build_object_read_to_sequence_tag() {
+        // read_to(0x0018,0x6011) must include the sequence and stop before (0020,4000)
+        let tokens = tokens_with_sequence();
+        let obj = InMemDicomObject::build_object(
+            &mut tokens.into_iter().map(Result::Ok),
+            StandardDataDictionary,
+            false,
+            Length::UNDEFINED,
+            None,
+            Some(Tag(0x0018, 0x6011)),
+        )
+        .unwrap();
+
+        assert!(
+            obj.element(Tag(0x0018, 0x6011)).is_ok(),
+            "sequence should be present"
+        );
+        assert!(
+            obj.element(Tag(0x0020, 0x4000)).is_err(),
+            "element after sequence should be absent"
+        );
+    }
+
+    #[test]
+    fn build_object_read_to_element_after_sequence() {
+        // read_to(0x0020,0x4000) must include both the sequence and (0020,4000)
+        let tokens = tokens_with_sequence();
+        let obj = InMemDicomObject::build_object(
+            &mut tokens.into_iter().map(Result::Ok),
+            StandardDataDictionary,
+            false,
+            Length::UNDEFINED,
+            None,
+            Some(Tag(0x0020, 0x4000)),
+        )
+        .unwrap();
+
+        assert!(
+            obj.element(Tag(0x0018, 0x6011)).is_ok(),
+            "sequence should be present"
+        );
+        assert!(
+            obj.element(Tag(0x0020, 0x4000)).is_ok(),
+            "element at read_to tag should be present"
+        );
+    }
+
+    #[test]
+    fn build_object_read_to_and_read_until_same_sequence_tag() {
+        // when both are the same tag, read_until wins and the tag is excluded
+        let tokens = tokens_with_sequence();
+        let obj = InMemDicomObject::build_object(
+            &mut tokens.into_iter().map(Result::Ok),
+            StandardDataDictionary,
+            false,
+            Length::UNDEFINED,
+            Some(Tag(0x0018, 0x6011)),
+            Some(Tag(0x0018, 0x6011)),
+        )
+        .unwrap();
+
+        assert!(
+            obj.element(Tag(0x0018, 0x6011)).is_err(),
+            "read_until takes priority: sequence should be excluded"
+        );
+    }
+
+    #[test]
+    fn build_object_read_to_sequence_equals_read_until_next() {
+        // read_to(seq) should give the same result as read_until(next element)
+        let tokens_a = tokens_with_sequence();
+        let tokens_b = tokens_with_sequence();
+
+        let obj_read_to = InMemDicomObject::build_object(
+            &mut tokens_a.into_iter().map(Result::Ok),
+            StandardDataDictionary,
+            false,
+            Length::UNDEFINED,
+            None,
+            Some(Tag(0x0018, 0x6011)),
+        )
+        .unwrap();
+
+        let obj_read_until = InMemDicomObject::build_object(
+            &mut tokens_b.into_iter().map(Result::Ok),
+            StandardDataDictionary,
+            false,
+            Length::UNDEFINED,
+            Some(Tag(0x0020, 0x4000)),
+            None,
+        )
+        .unwrap();
+
+        assert_obj_eq(&obj_read_to, &obj_read_until);
     }
 }

@@ -34,12 +34,12 @@
 //! ```
 #[cfg(feature = "cli")]
 use clap::ValueEnum;
+use dicom_core::VR;
 #[cfg(feature = "sop-class")]
 use dicom_core::dictionary::UidDictionary;
 use dicom_core::dictionary::{DataDictionary, DataDictionaryEntry};
 use dicom_core::header::Header;
 use dicom_core::value::{PrimitiveValue, Value as DicomValue};
-use dicom_core::VR;
 #[cfg(feature = "sop-class")]
 use dicom_dictionary_std::StandardSopClassDictionary;
 use dicom_encoding::transfer_syntax::TransferSyntaxIndex;
@@ -50,14 +50,14 @@ use dicom_transfer_syntax_registry::TransferSyntaxRegistry;
 use owo_colors::*;
 use std::borrow::Cow;
 use std::fmt::{self, Display, Formatter};
-use std::io::{stdout, Result as IoResult, Write};
+use std::io::{Result as IoResult, Write, stdout};
 use std::str::FromStr;
 
 #[derive(Clone, Debug, PartialEq, Default)]
 #[cfg_attr(feature = "cli", derive(ValueEnum))]
 pub enum DumpFormat {
     /// Text dump of DICOM file
-    /// 
+    ///
     /// It is primarily designed to be human readable,
     /// although its output can be used to recover the original object
     /// in its uncut form (no limit width).
@@ -72,7 +72,6 @@ pub enum DumpFormat {
     /// provided via [`dicom_json`]
     Json,
 }
-
 
 /// Options and flags to configure how to dump a DICOM file or object.
 ///
@@ -236,14 +235,13 @@ impl DumpOptions {
                 dump(&mut to, obj, width, 0, no_text_limit, no_limit)?;
 
                 Ok(())
-            },
+            }
             DumpFormat::Json => {
                 let json_obj = DicomJson::from(obj);
                 serde_json::to_writer_pretty(stdout(), &json_obj)?;
                 Ok(())
             }
         }
-
     }
 
     /// Dump the contents of a DICOM object to standard output.
@@ -663,8 +661,8 @@ where
             let byte_len = offset_table.len() * 4;
             let summary = offset_table_summary(
                 offset_table,
-                Some(width)
-                    .filter(|_| !no_limit)
+                (!no_limit)
+                    .then_some(width)
                     .map(|w| w.saturating_sub(38 + depth * 2)),
             );
             writeln!(
@@ -681,8 +679,8 @@ where
                 let byte_len = fragment.len();
                 let summary = item_value_summary(
                     fragment,
-                    Some(width)
-                        .filter(|_| !no_limit)
+                    (!no_limit)
+                        .then_some(width)
                         .map(|w| w.saturating_sub(38 + depth * 2)),
                 );
                 writeln!(
@@ -973,7 +971,7 @@ fn determine_width(user_width: Option<u32>) -> u32 {
 #[cfg(test)]
 mod tests {
 
-    use dicom_core::{value::DicomDate, DataElement, PrimitiveValue, VR};
+    use dicom_core::{DataElement, PrimitiveValue, VR, value::DicomDate};
     use dicom_dictionary_std::tags;
     use dicom_object::{FileMetaTableBuilder, InMemDicomObject};
 
@@ -1141,6 +1139,7 @@ mod tests {
       "1.2.888.123"
     ]
   }
-}"#);
+}"#
+        );
     }
 }

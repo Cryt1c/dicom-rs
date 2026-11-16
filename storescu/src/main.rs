@@ -1,10 +1,12 @@
 use clap::Parser;
-use dicom_core::{dicom_value, header::Tag, DataElement, VR};
+use dicom_app_common::{ConnectionOptions, TlsOptions, parse_duration_sec};
+use dicom_core::{DataElement, VR, dicom_value, header::Tag};
 use dicom_dictionary_std::{tags, uids};
-use dicom_encoding::transfer_syntax;
 use dicom_encoding::TransferSyntax;
-use dicom_object::{mem::InMemDicomObject, DefaultDicomObject, StandardDataDictionary};
+use dicom_encoding::transfer_syntax;
+use dicom_object::{DefaultDicomObject, StandardDataDictionary, mem::InMemDicomObject};
 use dicom_transfer_syntax_registry::TransferSyntaxRegistry;
+use dicom_ul::ClientAssociationOptions;
 use indicatif::{ProgressBar, ProgressStyle};
 use snafu::prelude::*;
 use snafu::{Report, Whatever};
@@ -14,7 +16,9 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::Mutex;
-use tracing::{debug, error, info, warn, Level};
+use tracing::debug;
+use tracing::{Level, error, info, warn};
+use tracing_subscriber::filter::EnvFilter;
 use transfer_syntax::TransferSyntaxIndex;
 use walkdir::WalkDir;
 
@@ -35,9 +39,6 @@ struct App {
     /// verbose mode
     #[arg(short = 'v', long = "verbose")]
     verbose: bool,
-    /// the C-STORE message ID
-    #[arg(short = 'm', long = "message-id", default_value = "1")]
-    message_id: u16,
     /// the calling Application Entity title
     #[arg(long = "calling-ae-title", default_value = "STORE-SCU")]
     calling_ae_title: String,
@@ -48,8 +49,8 @@ struct App {
     /// the maximum PDU length accepted by the SCU
     #[arg(
         long = "max-pdu-length",
-        default_value = "16384",
-        value_parser(clap::value_parser!(u32).range(4096..=131_072))
+        default_value = "16378",
+        value_parser(clap::value_parser!(u32).range(1018..))
     )]
     max_pdu_length: u32,
     /// fail if not all DICOM files can be transferred
@@ -60,6 +61,9 @@ struct App {
     // hide option if transcoding is disabled
     #[cfg_attr(not(feature = "transcode"), arg(hide(true)))]
     never_transcode: bool,
+    /// ignore SOP class in presentation context selection
+    #[arg(long)]
+    ignore_sop_class: bool,
     /// User Identity username
     #[arg(
         long = "username",
@@ -98,8 +102,21 @@ struct App {
     /// Dispatch these many service users to send files in parallel
     #[arg(short = 'c', long = "concurrency")]
     concurrency: Option<usize>,
+
+    /// timeout for TCP connection establishment in seconds
+    #[arg(
+        long = "connect-timeout",
+        value_name = "SECS",
+        value_parser(parse_duration_sec)
+    )]
+    connect_timeout: Option<Duration>,
+    #[command(flatten, next_help_heading = "Connection Options")]
+    connection: ConnectionOptions,
+    #[command(flatten, next_help_heading = "TLS Options")]
+    tls: TlsOptions,
 }
 
+#[derive(Debug)]
 struct DicomFile {
     /// File path
     file: PathBuf,
@@ -112,14 +129,14 @@ struct DicomFile {
     /// Transfer Syntax selected
     ts_selected: Option<String>,
     /// Presentation Context selected
-    pc_selected: Option<dicom_ul::pdu::PresentationContextResult>,
+    pc_selected: Option<dicom_ul::pdu::PresentationContextNegotiated>,
 }
 
 #[derive(Debug, Snafu)]
 enum Error {
     /// Could not initialize SCU
     Scu {
-        source: Box<dicom_ul::association::client::Error>,
+        source: Box<dicom_ul::association::Error>,
     },
 
     /// Could not construct DICOM command
@@ -167,10 +184,100 @@ enum Error {
     WriteIO {
         source: std::io::Error,
     },
+
+    #[snafu(display("TLS error: {}", source))]
+    Tls {
+        source: dicom_app_common::TlsError,
+    },
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn get_scu_options<'a>(
+    calling_ae_title: String,
+    called_ae_title: Option<String>,
+    max_pdu_length: u32,
+    username: Option<String>,
+    password: Option<String>,
+    kerberos_service_ticket: Option<String>,
+    saml_assertion: Option<String>,
+    jwt: Option<String>,
+    presentation_contexts: &'a HashSet<(String, String)>,
+    #[cfg(feature = "tls")] tls_options: Option<rustls::ClientConfig>,
+) -> ClientAssociationOptions<'a> {
+    let mut scu_init = ClientAssociationOptions::new()
+        .calling_ae_title(calling_ae_title)
+        .max_pdu_length(max_pdu_length);
+
+    #[cfg(feature = "tls")]
+    {
+        if let Some(tls_options) = tls_options {
+            scu_init = scu_init.server_name("localhost").tls_config(tls_options);
+        }
+    }
+
+    for (storage_sop_class_uid, transfer_syntax) in presentation_contexts {
+        scu_init = scu_init.with_presentation_context(storage_sop_class_uid, vec![transfer_syntax]);
+    }
+
+    if let Some(called_ae_title) = called_ae_title {
+        scu_init = scu_init.called_ae_title(called_ae_title);
+    }
+
+    if let Some(username) = username {
+        scu_init = scu_init.username(username);
+    }
+
+    if let Some(password) = password {
+        scu_init = scu_init.password(password);
+    }
+
+    if let Some(kerberos_service_ticket) = kerberos_service_ticket {
+        scu_init = scu_init.kerberos_service_ticket(kerberos_service_ticket);
+    }
+
+    if let Some(saml_assertion) = saml_assertion {
+        scu_init = scu_init.saml_assertion(saml_assertion);
+    }
+
+    if let Some(jwt) = jwt {
+        scu_init = scu_init.jwt(jwt);
+    }
+    scu_init
 }
 
 fn main() {
     let app = App::parse();
+    tracing::subscriber::set_global_default(
+        tracing_subscriber::FmtSubscriber::builder()
+            .with_max_level(Level::INFO)
+            .with_env_filter(
+                EnvFilter::from_default_env()
+                    .add_directive("dicom_app_common=info".parse().unwrap())
+                    .add_directive(
+                        if app.verbose {
+                            "dicom_storescu=debug"
+                        } else {
+                            "dicom_storescu=info"
+                        }
+                        .parse()
+                        .unwrap(),
+                    )
+                    .add_directive(
+                        if app.verbose {
+                            "dicom_app_common=debug"
+                        } else {
+                            "dicom_app_common=info"
+                        }
+                        .parse()
+                        .unwrap(),
+                    ),
+            )
+            .finish(),
+    )
+    .whatever_context("Could not set up global logging subscriber")
+    .unwrap_or_else(|e: Whatever| {
+        eprintln!("[ERROR] {}", Report::from_error(e));
+    });
     match app.concurrency {
         Some(0) | None => {
             run(app).unwrap_or_else(|e| {
@@ -258,47 +365,53 @@ fn check_files(
 }
 
 fn run(app: App) -> Result<(), Error> {
-    use crate::store_sync::{get_scu, send_file};
     let App {
         addr,
         files,
         verbose,
-        message_id,
         calling_ae_title,
         called_ae_title,
         max_pdu_length,
         fail_first,
         mut never_transcode,
+        ignore_sop_class,
         username,
         password,
         kerberos_service_ticket,
         saml_assertion,
         jwt,
         concurrency: _,
+        connect_timeout,
+        connection,
+        tls,
     } = app;
 
     // never transcode if the feature is disabled
     if cfg!(not(feature = "transcode")) {
         never_transcode = true;
     }
+    let tls_enabled = tls.enabled;
 
-    tracing::subscriber::set_global_default(
-        tracing_subscriber::FmtSubscriber::builder()
-            .with_max_level(if verbose { Level::DEBUG } else { Level::INFO })
-            .finish(),
-    )
-    .whatever_context("Could not set up global logging subscriber")
-    .unwrap_or_else(|e: Whatever| {
-        eprintln!("[ERROR] {}", Report::from_error(e));
-    });
+    #[cfg(not(feature = "tls"))]
+    if tls_enabled {
+        return Err(Error::Tls {
+            source: dicom_app_common::TlsError::TlsSupportNotAvailable,
+        });
+    }
+
+    #[cfg(feature = "tls")]
+    let config = if tls.enabled {
+        Some(tls.client_config().context(TlsSnafu)?)
+    } else {
+        None
+    };
 
     if verbose {
         info!("Establishing association with '{}'...", &addr);
     }
-    let (mut dicom_files, presentation_contexts) = check_files(files, verbose, never_transcode);
+    let (dicom_files, presentation_contexts) = check_files(files, verbose, never_transcode);
 
-    let mut scu = get_scu(
-        addr,
+    let mut scu_options = get_scu_options(
         calling_ae_title,
         called_ae_title,
         max_pdu_length,
@@ -307,39 +420,19 @@ fn run(app: App) -> Result<(), Error> {
         kerberos_service_ticket,
         saml_assertion,
         jwt,
-        presentation_contexts,
-    )?;
-
-    if verbose {
-        info!("Association established");
+        &presentation_contexts,
+        #[cfg(feature = "tls")]
+        config,
+    );
+    if let Some(timeout) = connection.read_timeout {
+        scu_options = scu_options.read_timeout(timeout);
     }
-
-    for file in &mut dicom_files {
-        // identify the right transfer syntax to use
-        let r: Result<_, Error> =
-            check_presentation_contexts(file, scu.presentation_contexts(), never_transcode);
-        match r {
-            Ok((pc, ts)) => {
-                if verbose {
-                    debug!(
-                        "{}: Selected presentation context: {:?}",
-                        file.file.display(),
-                        pc
-                    );
-                }
-                file.pc_selected = Some(pc);
-                file.ts_selected = Some(ts);
-            }
-            Err(e) => {
-                error!("{}", Report::from_error(e));
-                if fail_first {
-                    let _ = scu.abort();
-                    std::process::exit(-2);
-                }
-            }
-        }
+    if let Some(timeout) = connection.write_timeout {
+        scu_options = scu_options.write_timeout(timeout);
     }
-
+    if let Some(timeout) = connect_timeout {
+        scu_options = scu_options.connection_timeout(timeout);
+    }
     let progress_bar;
     if !verbose {
         progress_bar = Some(ProgressBar::new(dicom_files.len() as u64));
@@ -355,43 +448,60 @@ fn run(app: App) -> Result<(), Error> {
         progress_bar = None;
     }
 
-    for file in dicom_files {
-        scu = send_file(
+    #[cfg(feature = "tls")]
+    if tls_enabled {
+        let scu = scu_options
+            .establish_with_tls(&addr)
+            .map_err(Box::from)
+            .context(ScuSnafu)?;
+        store_sync::inner(
             scu,
-            file,
-            message_id,
-            progress_bar.as_ref(),
-            verbose,
+            dicom_files,
+            &progress_bar,
             fail_first,
+            verbose,
+            never_transcode,
+            ignore_sop_class,
         )?;
+        return Ok(());
     }
 
-    if let Some(pb) = progress_bar {
-        pb.finish_with_message("done")
-    };
-
-    scu.release().map_err(Box::from).context(ScuSnafu)?;
+    let scu = scu_options
+        .establish_with(&addr)
+        .map_err(Box::from)
+        .context(ScuSnafu)?;
+    store_sync::inner(
+        scu,
+        dicom_files,
+        &progress_bar,
+        fail_first,
+        verbose,
+        never_transcode,
+        ignore_sop_class,
+    )?;
     Ok(())
 }
 
 async fn run_async() -> Result<(), Error> {
-    use crate::store_async::{get_scu, send_file};
     let App {
         addr,
         files,
         verbose,
-        message_id,
         calling_ae_title,
         called_ae_title,
         max_pdu_length,
         fail_first,
         mut never_transcode,
+        ignore_sop_class,
         username,
         password,
         kerberos_service_ticket,
         saml_assertion,
         jwt,
         concurrency,
+        connect_timeout,
+        connection,
+        tls,
     } = App::parse();
 
     // never transcode if the feature is disabled
@@ -399,15 +509,20 @@ async fn run_async() -> Result<(), Error> {
         never_transcode = true;
     }
 
-    tracing::subscriber::set_global_default(
-        tracing_subscriber::FmtSubscriber::builder()
-            .with_max_level(if verbose { Level::DEBUG } else { Level::INFO })
-            .finish(),
-    )
-    .whatever_context("Could not set up global logging subscriber")
-    .unwrap_or_else(|e: Whatever| {
-        eprintln!("[ERROR] {}", Report::from_error(e));
-    });
+    let tls_enabled = tls.enabled;
+    #[cfg(not(feature = "tls"))]
+    if tls_enabled {
+        return Err(Error::Tls {
+            source: dicom_app_common::TlsError::TlsSupportNotAvailable,
+        });
+    }
+
+    #[cfg(feature = "tls")]
+    let config = if tls_enabled {
+        Some(tls.client_config().context(TlsSnafu)?)
+    } else {
+        None
+    };
 
     if verbose {
         info!("Establishing association with '{}'...", &addr);
@@ -448,9 +563,13 @@ async fn run_async() -> Result<(), Error> {
         let password = password.clone();
         let called_ae_title = called_ae_title.clone();
         let calling_ae_title = calling_ae_title.clone();
+        #[cfg(feature = "tls")]
+        let tls_config_clone = config.clone();
+        let connect_timeout_copy = connect_timeout;
+        let read_timeout_copy = connection.read_timeout;
+        let write_timeout_copy = connection.write_timeout;
         tasks.spawn(async move {
-            let mut scu = get_scu(
-                addr,
+            let mut scu_options = get_scu_options(
                 calling_ae_title,
                 called_ae_title,
                 max_pdu_length,
@@ -459,54 +578,68 @@ async fn run_async() -> Result<(), Error> {
                 kerberos_service_ticket,
                 saml_assertion,
                 jwt,
-                pc,
-            )
-            .await?;
-            loop {
-                let file = {
-                    let mut files = d_files.lock().await;
-                    files.pop()
-                };
-                let mut file = match file {
-                    Some(file) => file,
-                    None => break,
-                };
-                let r: Result<_, Error> = check_presentation_contexts(
-                    &file,
-                    scu.presentation_contexts(),
-                    never_transcode,
-                );
-                match r {
-                    Ok((pc, ts)) => {
-                        if verbose {
-                            debug!(
-                                "{}: Selected presentation context: {:?}",
-                                file.file.display(),
-                                pc
-                            );
-                        }
-                        file.pc_selected = Some(pc);
-                        file.ts_selected = Some(ts);
-                    }
-                    Err(e) => {
-                        error!("{}", Report::from_error(e));
-                        if fail_first {
-                            let _ = scu.abort().await;
-                            std::process::exit(-2);
-                        }
-                    }
-                }
-                scu = send_file(scu, file, message_id, pbx.as_ref(), verbose, fail_first).await?;
+                &pc,
+                #[cfg(feature = "tls")]
+                tls_config_clone,
+            );
+            if let Some(timeout) = read_timeout_copy {
+                scu_options = scu_options.read_timeout(timeout);
             }
-            let _ = scu.release().await;
-            Ok::<(), Error>(())
+            if let Some(timeout) = write_timeout_copy {
+                scu_options = scu_options.write_timeout(timeout);
+            }
+            if let Some(timeout) = connect_timeout_copy {
+                scu_options = scu_options.connection_timeout(timeout);
+            }
+            #[cfg(feature = "tls")]
+            if tls_enabled {
+                let scu = scu_options
+                    .establish_with_async_tls(&addr)
+                    .await
+                    .map_err(Box::from)
+                    .context(ScuSnafu)?;
+                return store_async::inner(
+                    scu,
+                    d_files,
+                    pbx,
+                    never_transcode,
+                    fail_first,
+                    verbose,
+                    ignore_sop_class,
+                )
+                .await;
+            }
+            let scu = scu_options
+                .establish_with_async(&addr)
+                .await
+                .map_err(Box::from)
+                .context(ScuSnafu)?;
+            store_async::inner(
+                scu,
+                d_files,
+                pbx,
+                never_transcode,
+                fail_first,
+                verbose,
+                ignore_sop_class,
+            )
+            .await
         });
     }
     while let Some(result) = tasks.join_next().await {
-        if let Err(e) = result {
-            error!("{}", Report::from_error(e));
-            if fail_first {
-                std::process::exit(-2);
+        match result {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => {
+                error!("{}", Report::from_error(e));
+                if fail_first {
+                    std::process::exit(-2)
+                }
+            }
+            Err(e) => {
+                error!("{}", Report::from_error(e));
+                if fail_first {
+                    std::process::exit(-2)
+                }
             }
         }
     }
@@ -565,8 +698,8 @@ fn check_file(file: &Path) -> Result<DicomFile, Error> {
 
     let meta = dicom_file.meta();
 
-    let storage_sop_class_uid = &meta.media_storage_sop_class_uid;
-    let storage_sop_instance_uid = &meta.media_storage_sop_instance_uid;
+    let storage_sop_class_uid = &meta.media_storage_sop_class_uid.trim_end_matches('\0');
+    let storage_sop_instance_uid = &meta.media_storage_sop_instance_uid.trim_end_matches('\0');
     let transfer_syntax_uid = &meta.transfer_syntax.trim_end_matches('\0');
     let ts = TransferSyntaxRegistry
         .get(transfer_syntax_uid)
@@ -585,9 +718,12 @@ fn check_file(file: &Path) -> Result<DicomFile, Error> {
 
 fn check_presentation_contexts(
     file: &DicomFile,
-    pcs: &[dicom_ul::pdu::PresentationContextResult],
+    pcs: &[dicom_ul::pdu::PresentationContextNegotiated],
+    ignore_sop_class: bool,
     never_transcode: bool,
-) -> Result<(dicom_ul::pdu::PresentationContextResult, String), Error> {
+) -> Result<(dicom_ul::pdu::PresentationContextNegotiated, String), Error> {
+    debug!("Testing file {file:?}");
+
     let file_ts = TransferSyntaxRegistry
         .get(&file.file_transfer_syntax)
         .with_context(|| UnsupportedFileTransferSyntaxSnafu {
@@ -595,13 +731,20 @@ fn check_presentation_contexts(
         })?;
 
     // Try to find an exact match for the file's transfer syntax first
-    let exact_match_pc = pcs.iter().find(|pc| pc.transfer_syntax == file_ts.uid());
+    let exact_match_pc = pcs
+        .iter()
+        .filter(|pc| ignore_sop_class || pc.abstract_syntax == file.sop_class_uid)
+        .find(|pc| pc.transfer_syntax == file_ts.uid());
 
     if let Some(pc) = exact_match_pc {
         return Ok((pc.clone(), pc.transfer_syntax.clone()));
     }
 
     let pc = pcs.iter().find(|pc| {
+        if !ignore_sop_class && pc.abstract_syntax != file.sop_class_uid {
+            return false;
+        }
+
         // Check support for this transfer syntax.
         // If it is the same as the file, we're good.
         // Otherwise, uncompressed data set encoding
@@ -624,6 +767,8 @@ fn check_presentation_contexts(
 
             // Else, if transcoding is possible, we go for it.
             pcs.iter()
+                // SOP class
+                .filter(|pc| ignore_sop_class || pc.abstract_syntax == file.sop_class_uid)
                 // accept explicit VR little endian
                 .find(|pc| pc.transfer_syntax == uids::EXPLICIT_VR_LITTLE_ENDIAN)
                 .or_else(||

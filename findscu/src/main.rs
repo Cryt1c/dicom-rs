@@ -1,11 +1,12 @@
 use clap::Parser;
+use dicom_app_common::{ConnectionOptions, parse_duration_sec};
 use dicom_core::dicom_value;
 use dicom_core::{DataElement, PrimitiveValue, VR};
 use dicom_dictionary_std::{tags, uids};
 use dicom_dump::DumpOptions;
 use dicom_encoding::transfer_syntax;
-use dicom_object::{mem::InMemDicomObject, open_file, StandardDataDictionary};
-use dicom_transfer_syntax_registry::{entries, TransferSyntaxRegistry};
+use dicom_object::{StandardDataDictionary, mem::InMemDicomObject, open_file};
+use dicom_transfer_syntax_registry::{TransferSyntaxRegistry, entries};
 use dicom_ul::pdu::Pdu;
 use dicom_ul::{
     association::ClientAssociationOptions,
@@ -13,9 +14,10 @@ use dicom_ul::{
 };
 use query::parse_queries;
 use snafu::prelude::*;
-use std::io::{stderr, BufRead as _, Read};
+use std::io::{BufRead as _, Read, stderr};
 use std::path::PathBuf;
-use tracing::{debug, error, info, warn, Level};
+use std::time::Duration;
+use tracing::{Level, debug, error, info, warn};
 use transfer_syntax::TransferSyntaxIndex;
 
 mod query;
@@ -47,8 +49,8 @@ struct App {
     /// the maximum PDU length
     #[arg(
         long = "max-pdu-length",
-        default_value = "16384",
-        value_parser(clap::value_parser!(u32).range(4096..=131_072))
+        default_value = "16378",
+        value_parser(clap::value_parser!(u32).range(1018..))
     )]
     max_pdu_length: u32,
 
@@ -66,6 +68,15 @@ struct App {
         conflicts_with = "patient"
     )]
     mwl: bool,
+    /// timeout for TCP connection establishment in seconds
+    #[arg(
+        long = "connect-timeout",
+        value_name = "SECS",
+        value_parser(parse_duration_sec)
+    )]
+    connect_timeout: Option<Duration>,
+    #[command(flatten, next_help_heading = "Connection Options")]
+    connection: ConnectionOptions,
 }
 
 fn main() {
@@ -79,7 +90,7 @@ fn main() {
 enum Error {
     /// Could not initialize SCU
     InitScu {
-        source: dicom_ul::association::client::Error,
+        source: dicom_ul::association::Error,
     },
 
     /// Could not construct DICOM command
@@ -186,6 +197,8 @@ fn run() -> Result<(), Error> {
         patient,
         study,
         mwl,
+        connect_timeout,
+        connection,
     } = App::parse();
 
     tracing::subscriber::set_global_default(
@@ -223,6 +236,15 @@ fn run() -> Result<(), Error> {
 
     if let Some(called_ae_title) = called_ae_title {
         scu_opt = scu_opt.called_ae_title(called_ae_title);
+    }
+    if let Some(timeout) = connection.read_timeout {
+        scu_opt = scu_opt.read_timeout(timeout);
+    }
+    if let Some(timeout) = connection.write_timeout {
+        scu_opt = scu_opt.write_timeout(timeout);
+    }
+    if let Some(timeout) = connect_timeout {
+        scu_opt = scu_opt.connection_timeout(timeout);
     }
 
     let mut scu = scu_opt.establish_with(&addr).context(InitScuSnafu)?;
@@ -360,9 +382,7 @@ fn run() -> Result<(), Error> {
                             .whatever_context("Could not read response data set")?
                     };
 
-                    println!(
-                        "------------------------ Match #{i} ------------------------"
-                    );
+                    println!("------------------------ Match #{i} ------------------------");
                     DumpOptions::new()
                         .dump_object(&dcm)
                         .context(DumpOutputSnafu)?;

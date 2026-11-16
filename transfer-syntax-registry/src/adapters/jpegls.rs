@@ -1,14 +1,13 @@
 //! Support for JPEG-LS image decoding.
 
 use charls::{CharLS, FrameInfo};
-use dicom_core::ops::{AttributeAction, AttributeOp};
 use dicom_core::Tag;
+use dicom_core::ops::{AttributeAction, AttributeOp};
 use dicom_encoding::adapters::{
-    decode_error, encode_error, DecodeResult, EncodeResult, PixelDataObject, PixelDataReader,
-    PixelDataWriter,
+    DecodeResult, EncodeResult, PixelDataObject, PixelDataReader, PixelDataWriter, decode_error,
+    encode_error,
 };
 use dicom_encoding::snafu::prelude::*;
-use std::borrow::Cow;
 
 /// Pixel data reader and writer for JPEG-LS transfer syntaxes.
 #[derive(Debug, Copy, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -37,60 +36,9 @@ impl PixelDataReader for JpegLsAdapter {
             "BitsAllocated other than 8 or 16 is not supported"
         );
 
-        let nr_frames = src.number_of_frames().unwrap_or(1) as usize;
-
-        ensure!(
-            nr_frames > frame as usize,
-            decode_error::FrameRangeOutOfBoundsSnafu
-        );
-
-        let raw = src
-            .raw_pixel_data()
-            .whatever_context("Expected to have raw pixel data available")?;
-
-        let frame_data = if raw.fragments.len() == 1 || raw.fragments.len() == nr_frames {
-            // assuming 1:1 frame-to-fragment mapping
-            Cow::Borrowed(
-                raw.fragments
-                    .get(frame as usize)
-                    .with_whatever_context(|| {
-                        format!("Missing fragment #{} for the frame requested", frame)
-                    })?,
-            )
-        } else {
-            // Some embedded JPEGs might span multiple fragments.
-            // In this case we look up the basic offset table
-            // and gather all of the frame's fragments in a single vector.
-            // Note: not the most efficient way to do this,
-            // consider optimizing later with byte chunk readers
-            let base_offset = raw.offset_table.get(frame as usize).copied();
-            let base_offset = if frame == 0 {
-                base_offset.unwrap_or(0) as usize
-            } else {
-                base_offset
-                    .with_whatever_context(|| format!("Missing offset for frame #{}", frame))?
-                    as usize
-            };
-            let next_offset = raw.offset_table.get(frame as usize + 1);
-
-            let mut offset = 0;
-            let mut fragments = Vec::new();
-            for fragment in &raw.fragments {
-                // include it
-                if offset >= base_offset {
-                    fragments.extend_from_slice(fragment);
-                }
-                offset += fragment.len() + 8;
-                if let Some(&next_offset) = next_offset {
-                    if offset >= next_offset as usize {
-                        // next fragment is for the next frame
-                        break;
-                    }
-                }
-            }
-
-            Cow::Owned(fragments)
-        };
+        let frame_data = src
+            .frame_pixel_data(frame)
+            .context(decode_error::FrameRangeOutOfBoundsSnafu)?;
 
         let mut decoded = CharLS::default()
             .decode(&frame_data)
@@ -136,24 +84,16 @@ impl PixelDataWriter for JpegLsAdapter {
             "BitsAllocated other than 8 or 16 is not supported"
         );
 
-        ensure_whatever!(
-            bits_stored != 1,
-            "BitsStored of 1 is not supported"
-        );
+        ensure_whatever!(bits_stored != 1, "BitsStored of 1 is not supported");
 
         let bytes_per_sample = (bits_allocated / 8) as usize;
         let frame_size =
             cols as usize * rows as usize * samples_per_pixel as usize * bytes_per_sample;
 
         // identify frame data using the frame index
-        let pixeldata_uncompressed = &src
-            .raw_pixel_data()
-            .context(encode_error::MissingAttributeSnafu { name: "Pixel Data" })?
-            .fragments[0];
-
-        let frame_data = pixeldata_uncompressed
-            .get(frame_size * frame as usize..frame_size * (frame as usize + 1))
-            .whatever_context("Frame index out of bounds")?;
+        let frame_data = src
+            .frame_pixel_data(frame)
+            .context(encode_error::FrameRangeOutOfBoundsSnafu)?;
 
         // Encode the data
         let mut encoder = CharLS::default();
@@ -180,7 +120,7 @@ impl PixelDataWriter for JpegLsAdapter {
         let near = ((1 << (bits_stored - 4)) * (100 - quality as i32) / 100).min(4096);
 
         let compressed_data = encoder
-            .encode(frame_info, near, frame_data)
+            .encode(frame_info, near, frame_data.as_ref())
             .whatever_context("JPEG-LS encoding failed")?;
 
         dst.extend_from_slice(&compressed_data);
@@ -204,14 +144,20 @@ impl PixelDataWriter for JpegLsAdapter {
         } else {
             vec![
                 // lossless image compression
-                AttributeOp::new(Tag(0x0028, 0x2110), AttributeAction::SetIfMissing("00".into())),
+                AttributeOp::new(
+                    Tag(0x0028, 0x2110),
+                    AttributeAction::SetIfMissing("00".into()),
+                ),
             ]
         };
 
         if samples_per_pixel == 1 {
             // set Photometric Interpretation to MONOCHROME2
             // if it was neither of the expected 1-channel formats
-            if pmi != Some("MONOCHROME1") && pmi != Some("MONOCHROME2") && pmi != Some("PALETTE COLOR") {
+            if pmi != Some("MONOCHROME1")
+                && pmi != Some("MONOCHROME2")
+                && pmi != Some("PALETTE COLOR")
+            {
                 changes.push(AttributeOp::new(
                     Tag(0x0028, 0x0004),
                     AttributeAction::SetStr("MONOCHROME2".into()),
@@ -232,7 +178,7 @@ impl PixelDataWriter for JpegLsAdapter {
     }
 }
 
-impl PixelDataWriter for JpegLsLosslessWriter {    
+impl PixelDataWriter for JpegLsLosslessWriter {
     fn encode_frame(
         &self,
         src: &dyn PixelDataObject,
@@ -244,7 +190,7 @@ impl PixelDataWriter for JpegLsLosslessWriter {
         options.quality = Some(100);
         JpegLsAdapter.encode_frame(src, frame, options, dst)
     }
-    
+
     fn encode(
         &self,
         src: &dyn PixelDataObject,

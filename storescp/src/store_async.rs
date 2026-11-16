@@ -1,13 +1,21 @@
+use std::path::Path;
+
+use dicom_app_common::{CSTORE_STATUS_UNACCEPTABLE_SOP_INSTANCE_UID, uid_for_filename};
 use dicom_dictionary_std::tags;
 use dicom_encoding::transfer_syntax::TransferSyntaxIndex;
 use dicom_object::{FileMetaTableBuilder, InMemDicomObject};
 use dicom_transfer_syntax_registry::TransferSyntaxRegistry;
-use dicom_ul::{pdu::PDataValueType, Pdu};
+use dicom_ul::prelude::*;
+use dicom_ul::{
+    Pdu,
+    association::AsyncServerAssociation,
+    pdu::{PDataValueType, PresentationContextResultReason},
+};
 use snafu::{OptionExt, Report, ResultExt, Whatever};
 use tracing::{debug, info, warn};
 
-use crate::{create_cecho_response, create_cstore_response, transfer::ABSTRACT_SYNTAXES, App};
-pub async fn run_store_async(
+use crate::{App, create_cecho_response, create_cstore_response, transfer::ABSTRACT_SYNTAXES};
+pub(crate) async fn run_store_async(
     scu_stream: tokio::net::TcpStream,
     args: &App,
 ) -> Result<(), Whatever> {
@@ -21,13 +29,12 @@ pub async fn run_store_async(
         out_dir,
         port: _,
         non_blocking: _,
+        connection,
+        #[cfg_attr(not(feature = "tls"), allow(unused_variables))]
+        tls,
+        #[cfg_attr(not(feature = "tls"), allow(unused_variables))]
+        tls_acceptor,
     } = args;
-    let verbose = *verbose;
-
-    let mut instance_buffer: Vec<u8> = Vec::with_capacity(1024 * 1024);
-    let mut msgid = 1;
-    let mut sop_class_uid = "".to_string();
-    let mut sop_instance_uid = "".to_string();
 
     let mut options = dicom_ul::association::ServerAssociationOptions::new()
         .accept_any()
@@ -35,6 +42,12 @@ pub async fn run_store_async(
         .strict(*strict)
         .max_pdu_length(*max_pdu_length)
         .promiscuous(*promiscuous);
+    if let Some(timeout) = connection.read_timeout {
+        options = options.read_timeout(timeout);
+    }
+    if let Some(timeout) = connection.write_timeout {
+        options = options.write_timeout(timeout);
+    }
 
     if *uncompressed_only {
         options = options
@@ -51,18 +64,92 @@ pub async fn run_store_async(
     for uid in ABSTRACT_SYNTAXES {
         options = options.with_abstract_syntax(*uid);
     }
+    let peer_addr = scu_stream.peer_addr().ok();
 
-    let mut association = options
+    #[cfg(feature = "tls")]
+    if tls.enabled {
+        let config = tls
+            .server_config(tls_acceptor)
+            .whatever_context("Could not create TLS config")?;
+        options = options.tls_config(config);
+        let association = options
+            .establish_tls_async(scu_stream)
+            .await
+            .whatever_context("could not establish association")?;
+        info!("New association from {}", association.peer_ae_title());
+        if args.verbose {
+            debug!(
+                "> Presentation contexts: {:?}",
+                association.presentation_contexts()
+            );
+        }
+        debug!(
+            "#accepted_presentation_contexts={}, acceptor_max_pdu_length={}, requestor_max_pdu_length={}",
+            association
+                .presentation_contexts()
+                .iter()
+                .filter(|pc| pc.reason == PresentationContextResultReason::Acceptance)
+                .count(),
+            association.acceptor_max_pdu_length(),
+            association.requestor_max_pdu_length(),
+        );
+        let peer_title = association.peer_ae_title().to_string();
+        inner(association, *verbose, out_dir).await?;
+
+        if let Some(peer_addr) = peer_addr {
+            info!("Dropping connection with {peer_title} ({peer_addr})");
+        } else {
+            info!("Dropping connection with {peer_title}");
+        }
+
+        return Ok(());
+    }
+
+    let association = options
         .establish_async(scu_stream)
         .await
         .whatever_context("could not establish association")?;
-
-    info!("New association from {}", association.client_ae_title());
+    info!("New association from {}", association.peer_ae_title());
+    if args.verbose {
+        debug!(
+            "> Presentation contexts: {:?}",
+            association.presentation_contexts()
+        );
+    }
     debug!(
-        "> Presentation contexts: {:?}",
-        association.presentation_contexts()
+        "#accepted_presentation_contexts={}, acceptor_max_pdu_length={}, requestor_max_pdu_length={}",
+        association
+            .presentation_contexts()
+            .iter()
+            .filter(|pc| pc.reason == PresentationContextResultReason::Acceptance)
+            .count(),
+        association.acceptor_max_pdu_length(),
+        association.requestor_max_pdu_length(),
     );
+    let peer_title = association.peer_ae_title().to_string();
+    inner(association, *verbose, out_dir).await?;
 
+    if let Some(peer_addr) = peer_addr {
+        info!("Dropping connection with {peer_title} ({peer_addr})");
+    } else {
+        info!("Dropping connection with {peer_title}");
+    }
+
+    Ok(())
+}
+
+async fn inner<T>(
+    mut association: AsyncServerAssociation<T>,
+    verbose: bool,
+    out_dir: &Path,
+) -> Result<(), Whatever>
+where
+    T: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
+{
+    let mut instance_buffer: Vec<u8> = Vec::with_capacity(1024 * 1024);
+    let mut msgid = 1;
+    let mut sop_class_uid = "".to_string();
+    let mut sop_instance_uid = "".to_string();
     loop {
         match association.receive().await {
             Ok(mut pdu) => {
@@ -150,47 +237,54 @@ pub async fn run_store_async(
                             {
                                 instance_buffer.append(&mut data_value.data);
 
-                                let presentation_context = association
-                                    .presentation_contexts()
-                                    .iter()
-                                    .find(|pc| pc.id == data_value.presentation_context_id)
-                                    .whatever_context("missing presentation context")?;
-                                let ts = &presentation_context.transfer_syntax;
+                                let status = if let Some(uid) = uid_for_filename(&sop_instance_uid)
+                                {
+                                    let presentation_context = association
+                                        .presentation_contexts()
+                                        .iter()
+                                        .find(|pc| pc.id == data_value.presentation_context_id)
+                                        .whatever_context("missing presentation context")?;
+                                    let ts = &presentation_context.transfer_syntax;
 
-                                let obj = InMemDicomObject::read_dataset_with_ts(
-                                    instance_buffer.as_slice(),
-                                    TransferSyntaxRegistry.get(ts).unwrap(),
-                                )
-                                .whatever_context("failed to read DICOM data object")?;
-                                let file_meta = FileMetaTableBuilder::new()
-                                    .media_storage_sop_class_uid(
-                                        obj.element(tags::SOP_CLASS_UID)
-                                            .whatever_context("missing SOP Class UID")?
-                                            .to_str()
-                                            .whatever_context("could not retrieve SOP Class UID")?,
+                                    let obj = InMemDicomObject::read_dataset_with_ts(
+                                        instance_buffer.as_slice(),
+                                        TransferSyntaxRegistry.get(ts).unwrap(),
                                     )
-                                    .media_storage_sop_instance_uid(
-                                        obj.element(tags::SOP_INSTANCE_UID)
-                                            .whatever_context("missing SOP Instance UID")?
-                                            .to_str()
-                                            .whatever_context("missing SOP Instance UID")?,
-                                    )
-                                    .transfer_syntax(ts)
-                                    .build()
-                                    .whatever_context(
-                                        "failed to build DICOM meta file information",
-                                    )?;
-                                let file_obj = obj.with_exact_meta(file_meta);
+                                    .whatever_context("failed to read DICOM data object")?;
+                                    let file_meta = FileMetaTableBuilder::new()
+                                        .media_storage_sop_class_uid(
+                                            obj.element(tags::SOP_CLASS_UID)
+                                                .whatever_context("missing SOP Class UID")?
+                                                .to_str()
+                                                .whatever_context(
+                                                    "could not retrieve SOP Class UID",
+                                                )?,
+                                        )
+                                        .media_storage_sop_instance_uid(
+                                            obj.element(tags::SOP_INSTANCE_UID)
+                                                .whatever_context("missing SOP Instance UID")?
+                                                .to_str()
+                                                .whatever_context("missing SOP Instance UID")?,
+                                        )
+                                        .transfer_syntax(ts)
+                                        .build()
+                                        .whatever_context(
+                                            "failed to build DICOM meta file information",
+                                        )?;
+                                    let file_obj = obj.with_exact_meta(file_meta);
 
-                                // write the files to the current directory with their SOPInstanceUID as filenames
-                                let mut file_path = out_dir.clone();
-                                file_path.push(
-                                    sop_instance_uid.trim_end_matches('\0').to_string() + ".dcm",
-                                );
-                                file_obj
-                                    .write_to_file(&file_path)
-                                    .whatever_context("could not save DICOM object to file")?;
-                                info!("Stored {}", file_path.display());
+                                    // write the files to the current directory with their SOPInstanceUID as filenames
+                                    let mut file_path = out_dir.to_path_buf();
+                                    file_path.push(uid.to_string() + ".dcm");
+                                    file_obj
+                                        .write_to_file(&file_path)
+                                        .whatever_context("could not save DICOM object to file")?;
+                                    info!("Stored {}", file_path.display());
+                                    0x0000
+                                } else {
+                                    warn!("Rejecting unacceptable SOP Instance UID for storage");
+                                    CSTORE_STATUS_UNACCEPTABLE_SOP_INSTANCE_UID
+                                };
 
                                 // send C-STORE-RSP object
                                 // commands are always in implicit VR LE
@@ -202,6 +296,7 @@ pub async fn run_store_async(
                                     msgid,
                                     &sop_class_uid,
                                     &sop_instance_uid,
+                                    status,
                                 );
 
                                 let mut obj_data = Vec::new();
@@ -231,10 +326,7 @@ pub async fn run_store_async(
                                 snafu::Report::from_error(e)
                             );
                         });
-                        info!(
-                            "Released association with {}",
-                            association.client_ae_title()
-                        );
+                        info!("Released association with {}", association.peer_ae_title());
                         break;
                     }
                     Pdu::AbortRQ { source } => {
@@ -244,7 +336,7 @@ pub async fn run_store_async(
                     _ => {}
                 }
             }
-            Err(err @ dicom_ul::association::server::Error::Receive { .. }) => {
+            Err(err @ dicom_ul::association::Error::ReceivePdu { .. }) => {
                 if verbose {
                     info!("{}", Report::from_error(err));
                 } else {
@@ -258,16 +350,5 @@ pub async fn run_store_async(
             }
         }
     }
-
-    if let Ok(peer_addr) = association.inner_stream().peer_addr() {
-        info!(
-            "Dropping connection with {} ({})",
-            association.client_ae_title(),
-            peer_addr
-        );
-    } else {
-        info!("Dropping connection with {}", association.client_ae_title());
-    }
-
     Ok(())
 }

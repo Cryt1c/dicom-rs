@@ -1,13 +1,13 @@
 //! Support for encapsulated uncompressed via pixel data adapter.
 
 use dicom_core::{
-    ops::{AttributeAction, AttributeOp},
     PrimitiveValue, Tag,
+    ops::{AttributeAction, AttributeOp},
 };
 use dicom_encoding::{
     adapters::{
-        decode_error, encode_error, DecodeResult, EncodeOptions, EncodeResult, PixelDataObject,
-        PixelDataReader, PixelDataWriter,
+        DecodeResult, EncodeOptions, EncodeResult, PixelDataObject, PixelDataReader,
+        PixelDataWriter, decode_error, encode_error,
     },
     snafu::OptionExt,
 };
@@ -38,16 +38,11 @@ impl PixelDataReader for UncompressedAdapter {
         dst: &mut Vec<u8>,
     ) -> DecodeResult<()> {
         // just copy the specific fragment into the output vector
-        let pixeldata = src
-            .raw_pixel_data()
-            .context(decode_error::MissingAttributeSnafu { name: "Pixel Data" })?;
-
-        let fragment = pixeldata
-            .fragments
-            .get(frame as usize)
+        let frame = src
+            .frame_pixel_data(frame)
             .context(decode_error::FrameRangeOutOfBoundsSnafu)?;
 
-        dst.extend_from_slice(fragment);
+        dst.extend_from_slice(frame.as_ref());
 
         Ok(())
     }
@@ -94,7 +89,7 @@ impl PixelDataWriter for UncompressedAdapter {
             .get(frame_size * frame as usize..frame_size * (frame as usize + 1))
             .whatever_context("Frame index out of bounds")?;
 
-        // Copy the the data to the output
+        // Copy the data to the output
         dst.extend_from_slice(frame_data);
 
         // provide attribute changes

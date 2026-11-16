@@ -1,24 +1,29 @@
 //! Support for JPEG XL image decoding and encoding.
 
-use dicom_core::ops::{AttributeAction, AttributeOp};
 use dicom_core::Tag;
-use dicom_encoding::adapters::{
-    decode_error, encode_error, DecodeResult, PixelDataObject, PixelDataReader, PixelDataWriter,
-};
+use dicom_core::ops::{AttributeAction, AttributeOp};
+use dicom_encoding::adapters::PixelDataObject;
+#[cfg(feature = "jxl-oxide")]
+use dicom_encoding::adapters::{DecodeResult, PixelDataReader, decode_error};
+#[cfg(feature = "zune-jpegxl")]
+use dicom_encoding::adapters::{PixelDataWriter, encode_error};
+
 use dicom_encoding::snafu::prelude::*;
+#[cfg(feature = "jxl-oxide")]
 use jxl_oxide::JxlImage;
-use zune_core::bit_depth::BitDepth;
-use zune_core::colorspace::ColorSpace;
-use zune_core::options::EncoderOptions;
+#[cfg(feature = "zune-jpegxl")]
+use zune_core::{bit_depth::BitDepth, colorspace::ColorSpace, options::EncoderOptions};
 
 /// Base pixel data adapter (decoder and encoder) for transfer syntaxes based on JPEG XL.
 #[derive(Debug, Copy, Clone, PartialEq, Eq, Hash)]
 pub struct JpegXlAdapter;
 
 /// Pixel data encoder specifically for JPEG XL lossless compression.
+#[cfg(feature = "zune-jpegxl")]
 #[derive(Debug, Copy, Clone, PartialEq, Eq, Hash)]
 pub struct JpegXlLosslessEncoder;
 
+#[cfg(feature = "jxl-oxide")]
 impl PixelDataReader for JpegXlAdapter {
     /// Decode a single frame in JPEG XL from a DICOM object.
     fn decode_frame(
@@ -60,7 +65,6 @@ impl PixelDataReader for JpegXlAdapter {
 
         // `stride` it the total number of bytes for each sample plane
         let stride: usize = bytes_per_sample as usize * cols as usize * rows as usize;
-        dst.reserve_exact(samples_per_pixel as usize * stride);
 
         let raw = src
             .raw_pixel_data()
@@ -77,6 +81,9 @@ impl PixelDataReader for JpegXlAdapter {
                 .with_whatever_context(|| {
                     format!("Missing fragment #{frame} for the frame requested")
                 })?;
+
+        // extend output vector
+        guarded_reserve(dst, samples_per_pixel as usize * stride, frame_data.len())?;
 
         let image = JxlImage::builder()
             .read(&**frame_data)
@@ -95,13 +102,11 @@ impl PixelDataReader for JpegXlAdapter {
             8 => {
                 // write directly to dst as u8 samples
 
-                let samples_per_frame = stream.channels() as usize * stream.width() as usize * stream.height() as usize;
-
-                dst.try_reserve(samples_per_frame)
-                    .whatever_context("Failed to reserve heap space for JPEG XL frame")?;
+                let samples_per_frame =
+                    stream.channels() as usize * stream.width() as usize * stream.height() as usize;
 
                 let offset = dst.len();
-                dst.resize(offset + samples_per_frame, 0);
+                guarded_resize(dst, samples_per_frame, frame_data.len())?;
 
                 let count = stream.write_to_buffer(&mut dst[offset..]);
                 dst.truncate(offset + count);
@@ -109,17 +114,18 @@ impl PixelDataReader for JpegXlAdapter {
             16 => {
                 // write all u16 samples to a buffer
 
-                let mut buffer =
-                    vec![
-                        0_u16;
-                        stream.channels() as usize * stream.width() as usize * stream.height() as usize
-                    ];
+                let mut buffer = vec![
+                    0_u16;
+                    stream.channels() as usize
+                        * stream.width() as usize
+                        * stream.height() as usize
+                ];
 
                 let count = stream.write_to_buffer(&mut buffer);
                 buffer.truncate(count);
 
                 // pass them as bytes in native endian
-                
+
                 for &sample in &buffer {
                     dst.extend_from_slice(&sample.to_ne_bytes());
                 }
@@ -127,11 +133,12 @@ impl PixelDataReader for JpegXlAdapter {
             24 => {
                 // write all f32 samples to a buffer
 
-                let mut buffer =
-                    vec![
-                        0_f32;
-                        stream.channels() as usize * stream.width() as usize * stream.height() as usize
-                    ];
+                let mut buffer = vec![
+                    0_f32;
+                    stream.channels() as usize
+                        * stream.width() as usize
+                        * stream.height() as usize
+                ];
 
                 let count = stream.write_to_buffer(&mut buffer);
                 buffer.truncate(count);
@@ -149,6 +156,7 @@ impl PixelDataReader for JpegXlAdapter {
     }
 }
 
+#[cfg(feature = "zune-jpegxl")]
 impl PixelDataWriter for JpegXlAdapter {
     fn encode_frame(
         &self,
@@ -182,17 +190,12 @@ impl PixelDataWriter for JpegXlAdapter {
         );
 
         let dicom_encoding::adapters::EncodeOptions {
-            quality,
-            effort,
-            ..
+            quality, effort, ..
         } = options;
 
         let bytes_per_sample = (bits_allocated / 8) as usize;
         let frame_size =
             cols as usize * rows as usize * samples_per_pixel as usize * bytes_per_sample;
-
-        // record dst length before encoding to know full jpeg size
-        let len_before = dst.len();
 
         // identify frame data using the frame index
         let pixeldata_uncompressed = &src
@@ -228,15 +231,13 @@ impl PixelDataWriter for JpegXlAdapter {
         options.set_effort(effort.map(|e| e + 27).unwrap_or(64));
         let encoder = JxlSimpleEncoder::new(frame_data, options);
 
-        let jxl = encoder.encode()
-            .map_err(|e| format!("{e:?}"))
+        let bytes_written = encoder
+            .encode(dst)
             .whatever_context("Failed to encode JPEG XL data")?;
-
-        dst.extend_from_slice(&jxl);
 
         // provide attribute changes
         let mut changes = if quality != 100 {
-            let compressed_frame_size = dst.len() - len_before;
+            let compressed_frame_size = bytes_written;
             let compression_ratio = frame_size as f64 / compressed_frame_size as f64;
             let compression_ratio = format!("{compression_ratio:.6}");
             vec![
@@ -255,7 +256,10 @@ impl PixelDataWriter for JpegXlAdapter {
         if samples_per_pixel == 1 {
             // set Photometric Interpretation to Monochrome2
             // if it was neither of the expected monochromes
-            if pmi != Some("MONOCHROME1") && pmi != Some("MONOCHROME2") && pmi != Some("PALETTE COLOR") {
+            if pmi != Some("MONOCHROME1")
+                && pmi != Some("MONOCHROME2")
+                && pmi != Some("PALETTE COLOR")
+            {
                 changes.push(AttributeOp::new(
                     Tag(0x0028, 0x0004),
                     AttributeAction::SetStr("MONOCHROME2".into()),
@@ -276,6 +280,7 @@ impl PixelDataWriter for JpegXlAdapter {
     }
 }
 
+#[cfg(feature = "zune-jpegxl")]
 impl PixelDataWriter for JpegXlLosslessEncoder {
     fn encode_frame(
         &self,
@@ -302,4 +307,42 @@ impl PixelDataWriter for JpegXlLosslessEncoder {
         options.quality = Some(100);
         JpegXlAdapter.encode(src, options, dst, offset_table)
     }
+}
+
+const COMPRESSION_RATIO_THRESHOLD: u32 = 64;
+
+fn guarded_reserve(
+    out: &mut Vec<u8>,
+    additional_capacity: usize,
+    encapsulated_size: usize,
+) -> DecodeResult<()> {
+    crate::alloc::guarded_reserve(
+        out,
+        additional_capacity,
+        encapsulated_size,
+        COMPRESSION_RATIO_THRESHOLD,
+    )
+    .ok()
+    .context(decode_error::AllocateSnafu {
+        name: "JPEG XL frame",
+        size: additional_capacity,
+    })
+}
+
+fn guarded_resize(
+    out: &mut Vec<u8>,
+    additional_capacity: usize,
+    encapsulated_size: usize,
+) -> DecodeResult<()> {
+    crate::alloc::guarded_resize(
+        out,
+        additional_capacity,
+        encapsulated_size,
+        COMPRESSION_RATIO_THRESHOLD,
+    )
+    .ok()
+    .context(decode_error::AllocateSnafu {
+        name: "JPEG XL frame",
+        size: additional_capacity,
+    })
 }

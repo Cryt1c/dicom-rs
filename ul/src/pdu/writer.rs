@@ -2,12 +2,14 @@
 use crate::pdu::*;
 use byteordered::byteorder::{BigEndian, WriteBytesExt};
 use dicom_encoding::text::TextCodec;
-use snafu::{Backtrace, ResultExt, Snafu};
+use snafu::{Backtrace, ResultExt, Snafu, ensure};
 use std::io::Write;
 
 pub type Error = crate::pdu::WriteError;
 
 pub type Result<T> = std::result::Result<T, WriteError>;
+
+const AE_TITLE_FIELD_LENGTH: usize = 16;
 
 #[derive(Debug, Snafu)]
 pub enum WriteChunkError {
@@ -66,6 +68,46 @@ where
     Ok(())
 }
 
+/// Encode an AE title for a fixed 16-byte association PDU field.
+///
+/// Called-AE-title and Calling-AE-title fields are encoded as 16 characters
+/// using the ISO 646:1990 Basic G0 Set. Leading and trailing spaces are
+/// non-significant, and an all-space value means "no Application Name specified".
+/// Rejects values longer than 16 bytes, optionally rejects all-space values, and
+/// pads shorter encoded values with spaces to preserve the DICOM UL field layout.
+fn encode_ae_title(
+    ae_title: &str,
+    field: &'static str,
+    codec: &dyn TextCodec,
+    validate_value: bool,
+) -> Result<Vec<u8>> {
+    let mut bytes = codec.encode(ae_title).context(EncodeFieldSnafu { field })?;
+
+    ensure!(
+        bytes.len() <= AE_TITLE_FIELD_LENGTH,
+        InvalidFixedSizeTextFieldSnafu {
+            field,
+            length: AE_TITLE_FIELD_LENGTH,
+            actual_length: bytes.len(),
+            reason: "exceeds fixed field length",
+        }
+    );
+
+    ensure!(
+        !validate_value || bytes.iter().any(|&byte| byte != b' '),
+        InvalidFixedSizeTextFieldSnafu {
+            field,
+            length: AE_TITLE_FIELD_LENGTH,
+            actual_length: bytes.len(),
+            reason: "must contain at least one non-space character",
+        }
+    );
+
+    bytes.resize(AE_TITLE_FIELD_LENGTH, b' ');
+
+    Ok(bytes)
+}
+
 pub fn write_pdu<W>(writer: &mut W, pdu: &Pdu) -> Result<()>
 where
     W: Write,
@@ -111,33 +153,25 @@ where
                     .write_u16::<BigEndian>(0x00)
                     .context(WriteReservedSnafu { bytes: 2_u32 })?;
 
-                // 11-26 - Called-AE-title - Destination DICOM Application Name. It shall be
-                // encoded as 16 characters as defined by the ISO 646:1990-Basic G0 Set with
-                // leading and trailing spaces (20H) being non-significant. The value made of 16
-                // spaces (20H) meaning "no Application Name specified" shall not be used. For a
-                // complete description of the use of this field, see Section 7.1.1.4.
-                let mut ae_title_bytes =
-                    codec.encode(called_ae_title).context(EncodeFieldSnafu {
+                // 11-26 - Called-AE-title - Destination DICOM Application Name. For a complete
+                // description of the use of this field, see Section 7.1.1.4.
+                let called_ae_title_bytes =
+                    encode_ae_title(called_ae_title, "Called-AE-title", &codec, true)?;
+                writer
+                    .write_all(&called_ae_title_bytes)
+                    .context(WriteFieldSnafu {
                         field: "Called-AE-title",
                     })?;
-                ae_title_bytes.resize(16, b' ');
-                writer.write_all(&ae_title_bytes).context(WriteFieldSnafu {
-                    field: "Called-AE-title",
-                })?;
 
-                // 27-42 - Calling-AE-title - Source DICOM Application Name. It shall be encoded
-                // as 16 characters as defined by the ISO 646:1990-Basic G0 Set with leading and
-                // trailing spaces (20H) being non-significant. The value made of 16 spaces
-                // (20H) meaning "no Application Name specified" shall not be used. For a
-                // complete description of the use of this field, see Section 7.1.1.3.
-                let mut ae_title_bytes =
-                    codec.encode(calling_ae_title).context(EncodeFieldSnafu {
+                // 27-42 - Calling-AE-title - Source DICOM Application Name. For a complete
+                // description of the use of this field, see Section 7.1.1.3.
+                let calling_ae_title_bytes =
+                    encode_ae_title(calling_ae_title, "Calling-AE-title", &codec, true)?;
+                writer
+                    .write_all(&calling_ae_title_bytes)
+                    .context(WriteFieldSnafu {
                         field: "Calling-AE-title",
                     })?;
-                ae_title_bytes.resize(16, b' ');
-                writer.write_all(&ae_title_bytes).context(WriteFieldSnafu {
-                    field: "Called-AE-title",
-                })?;
 
                 // 43-74 - Reserved - This reserved field shall be sent with a value 00H for all
                 // bytes but not tested to this value when received
@@ -211,25 +245,23 @@ where
                 // 11-26 - Reserved - This reserved field shall be sent with a value identical to
                 // the value received in the same field of the A-ASSOCIATE-RQ PDU, but its value
                 // shall not be tested when received.
-                let mut ae_title_bytes =
-                    codec.encode(called_ae_title).context(EncodeFieldSnafu {
+                let called_ae_title_bytes =
+                    encode_ae_title(called_ae_title, "Called-AE-title", &codec, false)?;
+                writer
+                    .write_all(&called_ae_title_bytes)
+                    .context(WriteFieldSnafu {
                         field: "Called-AE-title",
                     })?;
-                ae_title_bytes.resize(16, b' ');
-                writer.write_all(&ae_title_bytes).context(WriteFieldSnafu {
-                    field: "Called-AE-title",
-                })?;
                 // 27-42 - Reserved - This reserved field shall be sent with a value identical to
                 // the value received in the same field of the A-ASSOCIATE-RQ PDU, but its value
                 // shall not be tested when received.
-                let mut ae_title_bytes =
-                    codec.encode(calling_ae_title).context(EncodeFieldSnafu {
+                let calling_ae_title_bytes =
+                    encode_ae_title(calling_ae_title, "Calling-AE-title", &codec, false)?;
+                writer
+                    .write_all(&calling_ae_title_bytes)
+                    .context(WriteFieldSnafu {
                         field: "Calling-AE-title",
                     })?;
-                ae_title_bytes.resize(16, b' ');
-                writer.write_all(&ae_title_bytes).context(WriteFieldSnafu {
-                    field: "Calling-AE-title",
-                })?;
 
                 // 43-74 - Reserved - This reserved field shall be sent with a value identical to
                 // the value received in the same field of the A-ASSOCIATE-RQ PDU, but its value
@@ -796,7 +828,7 @@ fn write_pdu_variable_presentation_context_result(
         // 2 - Reserved - This reserved field shall be sent with a value 00H but not tested to this
         // value when received.
         writer
-            .write_u8(0x40)
+            .write_u8(0x00)
             .context(WriteReservedSnafu { bytes: 1_u32 })?;
 
         write_chunk_u16(writer, |writer| {
@@ -951,6 +983,56 @@ fn write_pdu_variable_user_variables(
                         name: "Implementation-class-uid",
                     })?;
                 }
+                UserVariableItem::ScuScpRoleSelectionSubItem(
+                    sop_class_uid,
+                    RequestorRoles {
+                        scu: scu_role,
+                        scp: scp_role,
+                    },
+                ) => {
+                    // 1 - Item-type - 54H
+                    writer
+                        .write_u8(0x54)
+                        .context(WriteFieldSnafu { field: "Item-type" })?;
+
+                    // 2 - Reserved - This reserved field shall be sent with a value 00H but not
+                    // tested to this value when received.
+                    writer
+                        .write_u8(0x00)
+                        .context(WriteReservedSnafu { bytes: 1_u32 })?;
+
+                    // 3-4 - Item-length
+                    write_chunk_u16(writer, |writer| {
+                        // 5-6 - UID-length
+                        write_chunk_u16(writer, |writer| {
+                            //  7-xxx - The SOP Class or Meta SOP Class identifier encoded as a UID
+                            //  as defined in Section 9 “Unique Identifiers (UIDs)” in PS3.5.
+                            writer
+                                .write_all(&codec.encode(sop_class_uid).context(
+                                    EncodeFieldSnafu {
+                                        field: "SOP-class-uid",
+                                    },
+                                )?)
+                                .context(WriteFieldSnafu {
+                                    field: "SOP-class-uid",
+                                })
+                        })
+                        .context(WriteChunkSnafu {
+                            name: "SOP-class-uid",
+                        })?;
+
+                        // xxx - SCU-role
+                        writer
+                            .write_u8(if *scu_role { 1 } else { 0 })
+                            .context(WriteFieldSnafu { field: "SCU-role" })?;
+
+                        // xxx - SCP-role
+                        writer
+                            .write_u8(if *scp_role { 1 } else { 0 })
+                            .context(WriteFieldSnafu { field: "SCP-role" })
+                    })
+                    .context(WriteChunkSnafu { name: "Sub-item" })?;
+                }
                 UserVariableItem::SopClassExtendedNegotiationSubItem(sop_class_uid, data) => {
                     // 1 - Item-type - 56H
                     writer
@@ -980,17 +1062,12 @@ fn write_pdu_variable_user_variables(
                             name: "SOP-class-uid",
                         })?;
 
-                        write_chunk_u16(writer, |writer| {
-                            // xxx-xxx Service-class-application-information - This field shall contain
-                            // the application information specific to the Service Class specification
-                            // identified by the SOP-class-uid. The semantics and value of this field is
-                            // defined in the identified Service Class specification.
-                            writer.write_all(data).context(WriteFieldSnafu {
-                                field: "Service-class-application-information",
-                            })
-                        })
-                        .context(WriteChunkSnafu {
-                            name: "Service-class-application-information",
+                        // xxx-xxx Service-class-application-information - This field shall contain
+                        // the application information specific to the Service Class specification
+                        // identified by the SOP-class-uid. The semantics and value of this field is
+                        // defined in the identified Service Class specification.
+                        writer.write_all(data).context(WriteFieldSnafu {
+                            field: "Service-class-application-information",
                         })
                     })
                     .context(WriteChunkSnafu { name: "Sub-item" })?;
@@ -1086,6 +1163,7 @@ fn write_pdu_variable_user_variables(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Cursor;
 
     #[test]
     fn can_write_chunks_with_preceding_u32_length() -> Result<()> {
@@ -1193,5 +1271,68 @@ mod tests {
                 0x02, 0x06,
             ]
         );
+    }
+
+    #[test]
+    fn extended_negotiation_bytestream_roundtrip() -> Result<()> {
+        let pdu = Pdu::AssociationRQ(AssociationRQ {
+            protocol_version: 1,
+            calling_ae_title: "SCU".to_string(),
+            called_ae_title: "SCP".to_string(),
+            application_context_name: "1.2.3".to_string(),
+            presentation_contexts: vec![],
+            user_variables: vec![UserVariableItem::SopClassExtendedNegotiationSubItem(
+                "1.2.3.4".to_string(),
+                vec![1, 0, 1, 1],
+            )],
+        });
+        let mut out = Vec::<u8>::new();
+
+        // Serialize and check serialized stream
+        write_pdu(&mut out, &pdu)?;
+
+        #[rustfmt::skip]
+        assert_eq!(
+            out,
+            &[1, 0,             // A-ASSOCIATE-RQ PDU type and reserved byte
+            0, 0, 0, 98,        // PDU Total length (Big Endian)
+                0, 1,           // Protocol version bits (BE)
+                0, 0,           // Reserved
+
+                // Called AE Title, space-padded
+                b'S', b'C', b'P', b' ', b' ', b' ', b' ', b' ',
+                b' ', b' ', b' ', b' ', b' ', b' ', b' ', b' ',
+
+                // Calling AE Title, space-padded
+                b'S', b'C', b'U', b' ', b' ', b' ', b' ', b' ',
+                b' ', b' ', b' ', b' ', b' ', b' ', b' ', b' ',
+
+                // 32 reserved bytes
+                0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+                0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+
+                0x10, 0,            // Application Context Name container
+                    0, 5,           // Length of Application Context Name (BE)
+                    b'1', b'.', b'2', b'.', b'3',  // Application Context Name
+
+                0x50, 0,            // User Variables container
+                    0, 17,          // Total length of User Variables (BE)
+                        0x56, 0,    // Extended Negotiation container
+                        0, 13,      // Length of bytes contained in E.N. (BE)
+                            0, 7,   // Length of SOP Class UID string (BE)
+                                // SOP Class UID string
+                                b'1', b'.', b'2', b'.', b'3', b'.', b'4',
+                            // Service-class-application-information field
+                            1, 0, 1, 1,
+            ],
+        );
+
+        // Deserialize and check against original A-ASSOCIATE-RQ PDU
+        // (checks that it round-trips)
+        let mut buf = Cursor::new(&mut out);
+        let pdu2 = read_pdu(&mut buf, 16384, false).unwrap().unwrap();
+        assert_eq!(pdu, pdu2);
+
+        Ok(())
     }
 }

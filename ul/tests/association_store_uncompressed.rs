@@ -1,9 +1,12 @@
 //! A test suite involving a store SCP
 //! which only accepts uncompressed transfer syntaxes
 
+#[cfg(feature = "async")]
+use dicom_ul::association::AsyncServerAssociation;
 use dicom_ul::{
+    ServerAssociation,
     association::client::ClientAssociationOptions,
-    pdu::{Pdu, PresentationContextResult, PresentationContextResultReason},
+    pdu::{Pdu, PresentationContextNegotiated, PresentationContextResultReason},
 };
 use std::net::SocketAddr;
 
@@ -24,7 +27,10 @@ static MR_IMAGE_STORAGE: &str = "1.2.840.10008.5.1.4.1.1.4";
 static DIGITAL_MG_STORAGE_SOP_CLASS_RAW: &str = "1.2.840.10008.5.1.4.1.1.1.2\0";
 static DIGITAL_MG_STORAGE_SOP_CLASS: &str = "1.2.840.10008.5.1.4.1.1.1.2";
 
-fn spawn_scp() -> Result<(std::thread::JoinHandle<Result<()>>, SocketAddr)> {
+fn spawn_scp() -> Result<(
+    std::thread::JoinHandle<Result<ServerAssociation<std::net::TcpStream>>>,
+    SocketAddr,
+)> {
     let listener = std::net::TcpListener::bind("localhost:0")?;
     let addr = listener.local_addr()?;
     let scp = ServerAssociationOptions::new()
@@ -35,24 +41,26 @@ fn spawn_scp() -> Result<(std::thread::JoinHandle<Result<()>>, SocketAddr)> {
         .with_transfer_syntax(EXPLICIT_VR_LE)
         .with_transfer_syntax(IMPLICIT_VR_LE);
 
-    let h = std::thread::spawn(move || -> Result<()> {
+    let h = std::thread::spawn(move || -> Result<_> {
         let (stream, _addr) = listener.accept()?;
         let mut association = scp.establish(stream)?;
 
         assert_eq!(
             association.presentation_contexts(),
             &[
-                PresentationContextResult {
+                PresentationContextNegotiated {
                     id: 1,
                     reason: PresentationContextResultReason::Acceptance,
                     transfer_syntax: IMPLICIT_VR_LE.to_string(),
+                    abstract_syntax: MR_IMAGE_STORAGE.to_string(),
                 },
                 // should always pick Explicit VR LE
                 // because JPEG baseline was not explicitly enabled in SCP
-                PresentationContextResult {
+                PresentationContextNegotiated {
                     id: 3,
                     reason: PresentationContextResultReason::Acceptance,
                     transfer_syntax: EXPLICIT_VR_LE.to_string(),
+                    abstract_syntax: DIGITAL_MG_STORAGE_SOP_CLASS.to_string(),
                 }
             ],
         );
@@ -62,13 +70,16 @@ fn spawn_scp() -> Result<(std::thread::JoinHandle<Result<()>>, SocketAddr)> {
         assert_eq!(pdu, Pdu::ReleaseRQ);
         association.send(&Pdu::ReleaseRP)?;
 
-        Ok(())
+        Ok(association)
     });
     Ok((h, addr))
 }
 
 #[cfg(feature = "async")]
-async fn spawn_scp_async() -> Result<(tokio::task::JoinHandle<Result<()>>, SocketAddr)> {
+async fn spawn_scp_async() -> Result<(
+    tokio::task::JoinHandle<Result<AsyncServerAssociation<tokio::net::TcpStream>>>,
+    SocketAddr,
+)> {
     let listener = tokio::net::TcpListener::bind("localhost:0").await?;
     let addr = listener.local_addr()?;
     let scp = ServerAssociationOptions::new()
@@ -86,17 +97,19 @@ async fn spawn_scp_async() -> Result<(tokio::task::JoinHandle<Result<()>>, Socke
         assert_eq!(
             association.presentation_contexts(),
             &[
-                PresentationContextResult {
+                PresentationContextNegotiated {
                     id: 1,
                     reason: PresentationContextResultReason::Acceptance,
                     transfer_syntax: IMPLICIT_VR_LE.to_string(),
+                    abstract_syntax: MR_IMAGE_STORAGE.to_string(),
                 },
                 // should always pick Explicit VR LE
                 // because JPEG baseline was not explicitly enabled in SCP
-                PresentationContextResult {
+                PresentationContextNegotiated {
                     id: 3,
                     reason: PresentationContextResultReason::Acceptance,
                     transfer_syntax: EXPLICIT_VR_LE.to_string(),
+                    abstract_syntax: DIGITAL_MG_STORAGE_SOP_CLASS.to_string(),
                 }
             ],
         );
@@ -106,7 +119,7 @@ async fn spawn_scp_async() -> Result<(tokio::task::JoinHandle<Result<()>>, Socke
         assert_eq!(pdu, Pdu::ReleaseRQ);
         association.send(&Pdu::ReleaseRP).await?;
 
-        Ok(())
+        Ok(association)
     });
     Ok((h, addr))
 }

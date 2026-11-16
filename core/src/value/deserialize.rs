@@ -1,9 +1,9 @@
 //! Parsing of primitive values
 use crate::value::partial::{
-    check_component, DateComponent, DicomDate, DicomDateTime, DicomTime,
-    Error as PartialValuesError,
+    DateComponent, DicomDate, DicomDateTime, DicomTime, Error as PartialValuesError,
+    check_component,
 };
-use chrono::{DateTime, FixedOffset, NaiveDate, NaiveDateTime, NaiveTime, TimeZone};
+use chrono::{FixedOffset, NaiveDate, NaiveTime};
 use snafu::{Backtrace, OptionExt, ResultExt, Snafu};
 use std::convert::TryFrom;
 use std::ops::{Add, Mul, Sub};
@@ -56,7 +56,7 @@ pub enum Error {
 
 type Result<T, E = Error> = std::result::Result<T, E>;
 
-/// Decode a single DICOM Date (DA) into a `chrono::NaiveDate` value.
+/// Decode a single DICOM Date (DA) into a [`chrono::NaiveDate`] value.
 /// As per standard, a full 8 byte representation (YYYYMMDD) is required,
 /// otherwise, the operation fails.
 pub fn parse_date(buf: &[u8]) -> Result<NaiveDate> {
@@ -83,10 +83,9 @@ pub fn parse_date(buf: &[u8]) -> Result<NaiveDate> {
     }
 }
 
-/** Decode a single DICOM Date (DA) into a `DicomDate` value.
- * Unlike `parse_date`, this method accepts incomplete dates such as YYYY and YYYYMM
- * The precision of the value is stored.
- */
+/// Decode a single DICOM Date (DA) into a [`DicomDate`] value.
+/// Unlike [`parse_date`], this method accepts incomplete dates such as YYYY and YYYYMM
+/// The precision of the value is stored.
 pub fn parse_date_partial(buf: &[u8]) -> Result<(DicomDate, &[u8])> {
     if buf.len() < 4 {
         UnexpectedEndOfElementSnafu.fail()
@@ -127,10 +126,9 @@ pub fn parse_date_partial(buf: &[u8]) -> Result<(DicomDate, &[u8])> {
     }
 }
 
-/** Decode a single DICOM Time (TM) into a `DicomTime` value.
- * Unlike `parse_time`, this method allows for missing Time components.
- * The precision of the second fraction is stored and can be returned as a range later.
- */
+/// Decode a single DICOM Time (TM) into a [`DicomTime`] value.
+/// Unlike [`parse_time`], this method allows for missing Time components.
+/// The precision of the second fraction is stored and can be returned as a range later.
 pub fn parse_time_partial(buf: &[u8]) -> Result<(DicomTime, &[u8])> {
     if buf.len() < 2 {
         UnexpectedEndOfElementSnafu.fail()
@@ -188,13 +186,12 @@ pub fn parse_time_partial(buf: &[u8]) -> Result<(DicomTime, &[u8])> {
     }
 }
 
-/** Decode a single DICOM Time (TM) into a `chrono::NaiveTime` value.
-* If a time component is missing, the operation fails.
-* Presence of the second fraction component `.FFFFFF` is mandatory with at
-  least one digit accuracy `.F` while missing digits default to zero.
-* For Time with missing components, or if exact second fraction accuracy needs to be preserved,
-  use `parse_time_partial`.
-*/
+/// Decode a single DICOM Time (TM) into a [`chrono::NaiveTime`] value.
+/// If a time component is missing, the operation fails.
+/// Presence of the second fraction component `.FFFFFF` is mandatory with at
+/// least one digit accuracy `.F` while missing digits default to zero.
+/// For Time with missing components, or if exact second fraction accuracy needs to be preserved,
+/// use [`parse_time_partial`].
 pub fn parse_time(buf: &[u8]) -> Result<(NaiveTime, &[u8])> {
     // at least HHMMSS.F required
     match buf.len() {
@@ -329,62 +326,11 @@ where
     })
 }
 
-/// Retrieve a `chrono::DateTime` from the given text, while assuming the given UTC offset.
-///
-/// If a date/time component is missing, the operation fails.
-/// Presence of the second fraction component `.FFFFFF` is mandatory with at
-/// least one digit accuracy `.F` while missing digits default to zero.
-///
-/// [`parse_datetime_partial`] should be preferred,
-/// because it is more flexible and resilient to missing components.
-/// See also the implementation of [`FromStr`](std::str::FromStr)
-/// for [`DicomDateTime`].
-#[deprecated(
-    since = "0.7.0",
-    note = "Use `parse_datetime_partial()` then `to_precise_datetime()`"
-)]
-pub fn parse_datetime(buf: &[u8], dt_utc_offset: FixedOffset) -> Result<DateTime<FixedOffset>> {
-    let date = parse_date(buf)?;
-    let buf = &buf[8..];
-    let (time, buf) = parse_time(buf)?;
-    let offset = match buf.len() {
-        0 => {
-            // A Date Time value without the optional suffix should be interpreted to be
-            // the local time zone of the application creating the Data Element, and can
-            // be overridden by the _Timezone Offset from UTC_ attribute.
-            let dt: Result<_> = dt_utc_offset
-                .from_local_datetime(&NaiveDateTime::new(date, time))
-                .single()
-                .context(InvalidDateTimeZoneSnafu);
-
-            return dt;
-        }
-        len if len > 4 => {
-            let tz_sign = buf[0];
-            let buf = &buf[1..];
-            let tz_h: i32 = read_number(&buf[0..2])?;
-            let tz_m: i32 = read_number(&buf[2..4])?;
-            let s = (tz_h * 60 + tz_m) * 60;
-            match tz_sign {
-                b'+' => FixedOffset::east_opt(s).context(SecsOutOfBoundsSnafu { secs: s })?,
-                b'-' => FixedOffset::west_opt(s).context(SecsOutOfBoundsSnafu { secs: s })?,
-                c => return InvalidTimeZoneSignTokenSnafu { value: c }.fail(),
-            }
-        }
-        _ => return UnexpectedEndOfElementSnafu.fail(),
-    };
-
-    offset
-        .from_local_datetime(&NaiveDateTime::new(date, time))
-        .single()
-        .context(InvalidDateTimeZoneSnafu)
-}
-
 /// Decode the text from the byte slice into a [`DicomDateTime`] value,
 /// which allows for missing Date / Time components.
 ///
-/// This is the underlying implementation of [`FromStr`](std::str::FromStr)
-/// for `DicomDateTime`.
+/// This is the underlying implementation of [`std::str::FromStr`]
+/// for [`DicomDateTime`].
 ///
 /// # Example
 ///

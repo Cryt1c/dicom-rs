@@ -24,13 +24,12 @@ use crate::adapters::{
     DynPixelDataReader, DynPixelDataWriter, NeverPixelAdapter, PixelDataReader, PixelDataWriter,
 };
 use crate::decode::{
-    basic::BasicDecoder, explicit_be::ExplicitVRBigEndianDecoder,
+    DecodeFrom, basic::BasicDecoder, explicit_be::ExplicitVRBigEndianDecoder,
     explicit_le::ExplicitVRLittleEndianDecoder, implicit_le::ImplicitVRLittleEndianDecoder,
-    DecodeFrom,
 };
 use crate::encode::{
-    explicit_be::ExplicitVRBigEndianEncoder, explicit_le::ExplicitVRLittleEndianEncoder,
-    implicit_le::ImplicitVRLittleEndianEncoder, EncodeTo, EncoderFor,
+    EncodeTo, EncoderFor, explicit_be::ExplicitVRBigEndianEncoder,
+    explicit_le::ExplicitVRLittleEndianEncoder, implicit_le::ImplicitVRLittleEndianEncoder,
 };
 use std::io::{Read, Write};
 
@@ -378,7 +377,6 @@ where
 pub enum NeverAdapter {}
 
 impl DataRWAdapter for NeverAdapter {
-
     fn adapt_reader<'r>(&self, _reader: Box<dyn Read + 'r>) -> Box<dyn Read + 'r> {
         unreachable!()
     }
@@ -518,7 +516,7 @@ impl<D, R, W> TransferSyntax<D, R, W> {
 
     /// Check whether this transfer syntax expects pixel data to be encapsulated.
     ///
-    /// This does not imply that the pixel data can be decoded. 
+    /// This does not imply that the pixel data can be decoded.
     pub fn is_encapsulated_pixel_data(&self) -> bool {
         matches!(self.codec, Codec::EncapsulatedPixelData(..))
     }

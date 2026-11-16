@@ -23,10 +23,10 @@
 //! - `jpeg` for JPEG lossy and lossless encodings via `jpeg-decoder` and `jpeg-encoder`;
 //! - `rle` for RLE compressed pixel data;
 //! - `deflate` for deflated data set compression via `flate2`.
-//! 
+//!
 //! See the [`dicom-transfer-syntax-registry` documentation][ts-registry]
 //! for an extended list of supported encodings and more details.
-//! 
+//!
 //! Alternatively, this library has an integration with [GDCM bindings],
 //! which serves as a different backend.
 //! This allows for decoding pixel data
@@ -42,7 +42,7 @@
 //! ```
 //!
 //! # Usage
-//! 
+//!
 //!
 //! # WebAssembly support
 //!
@@ -125,11 +125,11 @@ use attribute::VoiLut;
 use byteorder::{ByteOrder, NativeEndian};
 #[cfg(not(feature = "gdcm"))]
 use dicom_core::{DataDictionary, DicomValue};
+#[cfg(not(feature = "gdcm"))]
+use dicom_encoding::Codec;
 use dicom_encoding::adapters::DecodeError;
 #[cfg(not(feature = "gdcm"))]
 use dicom_encoding::transfer_syntax::TransferSyntaxIndex;
-#[cfg(not(feature = "gdcm"))]
-use dicom_encoding::Codec;
 #[cfg(not(feature = "gdcm"))]
 use dicom_object::{FileDicomObject, InMemDicomObject};
 #[cfg(not(feature = "gdcm"))]
@@ -143,10 +143,10 @@ use num_traits::NumCast;
 use rayon::iter::{IntoParallelIterator, IntoParallelRefIterator, ParallelIterator};
 #[cfg(all(feature = "rayon", feature = "image"))]
 use rayon::slice::ParallelSliceMut;
-#[cfg(not(feature = "gdcm"))]
-use snafu::ensure;
 #[cfg(any(not(feature = "gdcm"), feature = "image"))]
 use snafu::OptionExt;
+#[cfg(not(feature = "gdcm"))]
+use snafu::ensure;
 use snafu::{Backtrace, ResultExt, Snafu};
 use std::borrow::Cow;
 #[cfg(not(feature = "gdcm"))]
@@ -159,14 +159,18 @@ pub use ndarray;
 
 mod attribute;
 mod lut;
+mod overlay;
 mod transcode;
 
 pub mod encapsulation;
 pub(crate) mod transform;
 
 // re-exports
-pub use attribute::{PhotometricInterpretation, PixelRepresentation, PlanarConfiguration, AttributeName};
+pub use attribute::{
+    AttributeName, PhotometricInterpretation, PixelRepresentation, PlanarConfiguration,
+};
 pub use lut::{CreateLutError, Lut};
+pub use overlay::{OverlayError, OverlayPlane, OverlayType};
 pub use transcode::{Error as TranscodeError, Result as TranscodeResult, Transcode};
 pub use transform::{Rescale, VoiLutFunction, WindowLevel, WindowLevelTransform};
 
@@ -175,6 +179,7 @@ mod gdcm;
 
 /// Error type for most pixel data related operations.
 #[derive(Debug, Snafu)]
+#[snafu(source(from(exact)))]
 pub struct Error(InnerError);
 
 /// Inner error type
@@ -248,29 +253,42 @@ enum InnerError {
         frame_number: u32,
         backtrace: Backtrace,
     },
-    #[snafu(display("Value multiplicity of VOI LUT Function must match the number of frames. Expected `{nr_frames:?}`, found `{vm:?}`"))]
+    #[snafu(display(
+        "Value multiplicity of VOI LUT Function must match the number of frames. Expected `{nr_frames:?}`, found `{vm:?}`"
+    ))]
     LengthMismatchVoiLutFunction {
         vm: u32,
         nr_frames: u32,
         backtrace: Backtrace,
     },
-    #[snafu(display("Value multiplicity of Rescale Slope/Intercept must match. Found `{slope_vm:?}` (slope), `{intercept_vm:?}` (intercept)"))]
+    #[snafu(display(
+        "Value multiplicity of Rescale Slope/Intercept must match. Found `{slope_vm:?}` (slope), `{intercept_vm:?}` (intercept)"
+    ))]
     LengthMismatchRescale {
         intercept_vm: u32,
         slope_vm: u32,
         backtrace: Backtrace,
     },
-    #[snafu(display("Value multiplicity of Window Center/Width must match. Found `{wc_vm:?}` (center), `{ww_vm:?}` (width)"))]
+    #[snafu(display(
+        "Value multiplicity of Window Center/Width must match. Found `{wc_vm:?}` (center), `{ww_vm:?}` (width)"
+    ))]
     LengthMismatchWindowLevel {
         wc_vm: u32,
         ww_vm: u32,
         backtrace: Backtrace,
     },
-    #[snafu(display("Value multiplicity of VOI LUT must match the number of frames. Expected `{nr_frames:?}`, found `{vm:?}`"))]
+    #[snafu(display(
+        "Value multiplicity of VOI LUT must match the number of frames. Expected `{nr_frames:?}`, found `{vm:?}`"
+    ))]
     LengthMismatchVoiLut {
         vm: u32,
         nr_frames: u32,
         backtrace: Backtrace,
+    },
+    #[snafu(transparent)]
+    Overlay {
+        #[snafu(backtrace)]
+        source: overlay::OverlayError,
     },
 }
 
@@ -279,6 +297,12 @@ pub type Result<T, E = Error> = std::result::Result<T, E>;
 impl From<attribute::GetAttributeError> for crate::Error {
     fn from(source: attribute::GetAttributeError) -> Self {
         Error(crate::InnerError::GetAttribute { source })
+    }
+}
+
+impl From<overlay::OverlayError> for crate::Error {
+    fn from(source: overlay::OverlayError) -> Self {
+        Error(crate::InnerError::Overlay { source })
     }
 }
 
@@ -308,6 +332,8 @@ pub struct ConvertOptions {
     pub voi_lut: VoiLutOption,
     /// Output image bit depth
     pub bit_depth: BitDepthOption,
+    /// Photometric interpretation conversion option
+    pub photometric_interpretation: PhotometricInterpretationOption,
 }
 
 impl ConvertOptions {
@@ -348,6 +374,15 @@ impl ConvertOptions {
         self.bit_depth = BitDepthOption::Force16Bit;
         self
     }
+
+    /// Set the photometric interpretation option.
+    pub fn with_photometric_interpretation(
+        mut self,
+        photometric_interpretation: PhotometricInterpretationOption,
+    ) -> Self {
+        self.photometric_interpretation = photometric_interpretation;
+        self
+    }
 }
 
 /// Modality LUT function specifier.
@@ -384,17 +419,27 @@ pub enum ModalityLutOption {
 #[non_exhaustive]
 pub enum VoiLutOption {
     /// _Default behavior:_
-    /// apply the first VOI LUT function transformation described in the pixel data
-    /// only when converting to an image;
-    /// no VOI LUT function is performed
-    /// when converting to an ndarray or to bare pixel values.
+    /// apply the first VOI LUT function transformation
+    /// described in the pixel data object,
+    /// but only when converting to an image;
+    /// no VOI LUT function transformation is performed
+    /// when converting to an ndarray or to a bare pixel value vector.
     ///
-    /// If both a VOI LUT table and window values are present in the pixel data,
-    /// use the VOI LUT table.
+    /// If both a VOI LUT table and window values
+    /// are present in the pixel data object,
+    /// the VOI LUT table is used.
+    /// When converting to an image,
+    /// if no transformation parameters are defined,
+    /// pixel values are min-max normalized
+    /// as described in [`Normalize`](Self::Normalize).
     #[default]
     Default,
     /// Apply the first VOI LUT function transformation
-    /// described in the pixel data.
+    /// described in the pixel data object.
+    ///
+    /// If no transformation parameters are defined,
+    /// pixel values are min-max normalized
+    /// as described in [`Normalize`](Self::Normalize).
     First,
     /// Apply a custom window level instead of the one described in the object.
     Custom(WindowLevel),
@@ -428,6 +473,23 @@ pub enum BitDepthOption {
     Force8Bit,
     /// Force the output image to have 16 bits per sample.
     Force16Bit,
+}
+
+/// Output image photometric interpretation behavior.
+///
+/// Define how photometric interpretation conversions
+/// should be handled when converting to an image.
+///
+/// See also [`ConvertOptions`].
+#[derive(Debug, Default, Copy, Clone, PartialEq)]
+#[non_exhaustive]
+pub enum PhotometricInterpretationOption {
+    /// _Default behavior:_
+    /// invert pixeldata for Monochrome1 photometric interpretation.
+    #[default]
+    InvertMonochrome1,
+    /// Ignore photometric interpretation conversions.
+    Ignore,
 }
 
 /// A blob of decoded pixel data.
@@ -493,6 +555,11 @@ impl DecodedPixelData<'_> {
         &self.data
     }
 
+    /// Consume this value and retrieve the owned raw pixel data bytes.
+    pub fn into_data(self) -> Vec<u8> {
+        self.data.into_owned()
+    }
+
     /// Retrieve a copy of all raw pixel data samples
     /// as unsigned 16-bit integers.
     ///
@@ -506,7 +573,7 @@ impl DecodedPixelData<'_> {
     /// Retrieve a slice of a frame's raw pixel data samples as bytes,
     /// irrespective of the expected size of each sample.
     pub fn frame_data(&self, frame: u32) -> Result<&[u8]> {
-        let bytes_per_sample = (self.bits_allocated as usize + 7) / 8;
+        let bytes_per_sample = self.bits_allocated.div_ceil(8) as usize;
         let frame_length = self.rows as usize
             * self.cols as usize
             * self.samples_per_pixel as usize
@@ -618,7 +685,11 @@ impl DecodedPixelData<'_> {
                         }
                         .fail()?
                     }
-                    tracing::warn!("Expected `{:?}` rescale parameters, found `{:?}`, using first value for all", self.number_of_frames, len);
+                    tracing::warn!(
+                        "Expected `{:?}` rescale parameters, found `{:?}`, using first value for all",
+                        self.number_of_frames,
+                        len
+                    );
                     Ok(&self.rescale[0..1])
                 }
             }
@@ -629,7 +700,7 @@ impl DecodedPixelData<'_> {
     #[inline]
     pub fn voi_lut_function(&self) -> Result<Option<&[VoiLutFunction]>> {
         if let Some(inner) = &self.voi_lut_function {
-            let res = match &inner.len() {
+            match &inner.len() {
                 0 => Ok(None),
                 1 => Ok(Some(inner.as_slice())),
                 len => {
@@ -643,12 +714,15 @@ impl DecodedPixelData<'_> {
                             }
                             .fail()?
                         }
-                        tracing::warn!("Expected `{:?}` VOI LUT functions, found `{:?}`, using first value for all", self.number_of_frames, len);
+                        tracing::warn!(
+                            "Expected `{:?}` VOI LUT functions, found `{:?}`, using first value for all",
+                            self.number_of_frames,
+                            len
+                        );
                         Ok(Some(&inner[0..1]))
                     }
                 }
-            };
-            res
+            }
         } else {
             Ok(None)
         }
@@ -657,7 +731,7 @@ impl DecodedPixelData<'_> {
     #[inline]
     pub fn window(&self) -> Result<Option<&[WindowLevel]>> {
         if let Some(inner) = &self.window {
-            let res = match &inner.len() {
+            match &inner.len() {
                 0 => Ok(None),
                 1 => Ok(Some(inner.as_slice())),
                 len => {
@@ -671,12 +745,15 @@ impl DecodedPixelData<'_> {
                             }
                             .fail()?
                         }
-                        tracing::warn!("Expected `{:?}` Window Levels, found `{:?}`, using first value for all", self.number_of_frames, len);
+                        tracing::warn!(
+                            "Expected `{:?}` Window Levels, found `{:?}`, using first value for all",
+                            self.number_of_frames,
+                            len
+                        );
                         Ok(Some(&inner[0..1]))
                     }
                 }
-            };
-            res
+            }
         } else {
             Ok(None)
         }
@@ -966,6 +1043,7 @@ impl DecodedPixelData<'_> {
             modality_lut,
             voi_lut,
             bit_depth,
+            photometric_interpretation,
         } = options;
 
         let mut image = match self.bits_allocated {
@@ -1138,7 +1216,7 @@ impl DecodedPixelData<'_> {
                             }
                         };
 
-                        self.mono_image_with_narrow(buffer.into_iter(), *bit_depth)?
+                        self.mono_image_with_narrow(buffer, *bit_depth)?
                     }
 
                     ModalityLutOption::Default | ModalityLutOption::Override(..) => {
@@ -1278,7 +1356,9 @@ impl DecodedPixelData<'_> {
             _ => InvalidBitsAllocatedSnafu.fail()?,
         };
         // Convert MONOCHROME1 => MONOCHROME2
-        if self.photometric_interpretation == PhotometricInterpretation::Monochrome1 {
+        if *photometric_interpretation == PhotometricInterpretationOption::InvertMonochrome1
+            && self.photometric_interpretation == PhotometricInterpretation::Monochrome1
+        {
             image.invert();
         }
         Ok(image)
@@ -1436,6 +1516,7 @@ impl DecodedPixelData<'_> {
             modality_lut,
             voi_lut,
             bit_depth: _,
+            photometric_interpretation: _,
         } = options;
 
         if self.samples_per_pixel > 1 && self.planar_configuration != PlanarConfiguration::Standard
@@ -2038,7 +2119,7 @@ pub trait PixelDecoder {
         let mut px = self.decode_pixel_data()?;
 
         // calculate frame offset and size
-        let frame_size = ((px.bits_allocated + 7) / 8) as usize
+        let frame_size = px.bits_allocated.div_ceil(8) as usize
             * px.samples_per_pixel as usize
             * px.rows as usize
             * px.cols as usize;
@@ -2056,6 +2137,35 @@ pub trait PixelDecoder {
         px.number_of_frames = 1;
 
         Ok(px)
+    }
+
+    /// Decode all overlay planes in this object,
+    /// scanning the repeating groups `6000` to `601E`
+    /// (see [PS3.3 C.9.2][1] of the DICOM standard).
+    ///
+    /// Overlay data is recorded outside the pixel data
+    /// and is always in native form,
+    /// so no pixel data codec is involved.
+    /// Legacy overlay planes (retired in DICOM 2004)
+    /// which are embedded in unused bits of the pixel data samples
+    /// are also decoded,
+    /// as long as the pixel data is not in an encapsulated form.
+    ///
+    /// The default implementation yields no overlay planes.
+    ///
+    /// [1]: https://dicom.nema.org/medical/dicom/current/output/chtml/part03/sect_C.9.2.html
+    fn decode_overlays(&self) -> Result<Vec<OverlayPlane>> {
+        Ok(Vec::new())
+    }
+
+    /// Decode the overlay plane with the given index
+    /// (0 to 15, for the repeating groups `6000` to `601E`),
+    /// returning `Ok(None)` if the plane is not present.
+    ///
+    /// The default implementation yields no overlay plane.
+    fn decode_overlay(&self, index: u8) -> Result<Option<OverlayPlane>> {
+        let _ = index;
+        Ok(None)
     }
 }
 
@@ -2095,8 +2205,7 @@ impl ImagingProperties {
 
         let cols = cols(obj)?;
         let rows = rows(obj)?;
-        let photometric_interpretation =
-            photometric_interpretation(obj)?;
+        let photometric_interpretation = photometric_interpretation(obj)?;
         let samples_per_pixel = samples_per_pixel(obj)?;
         let planar_configuration = planar_configuration(obj)?;
         let bits_allocated = bits_allocated(obj)?;
@@ -2256,11 +2365,30 @@ where
             }
             DicomValue::Primitive(p) => {
                 // Non-encoded, just return the pixel data for all frames
-                p.to_bytes().to_vec()
+                let data = p.to_bytes();
+
+                if bits_allocated == 1 {
+                    // Expand 1-bit samples to 0/255 bytes for all frames
+                    let frame_pixels = (rows as usize) * (cols as usize);
+                    let frame_samples = frame_pixels * (samples_per_pixel as usize);
+                    let frame_size = frame_samples / 8;
+                    let frame_size_all = frame_size * (number_of_frames as usize);
+
+                    let frame_data = data.get(0..frame_size_all).context(FrameOutOfRangeSnafu {
+                        frame_number: frame_size_all as u32,
+                    })?;
+                    // Map every bit in each byte to a separate byte of either 0 or 255
+                    frame_data
+                        .iter()
+                        .flat_map(|&byte| (0..8).map(move |bit| ((byte >> bit) & 1) * 255))
+                        .take(frame_pixels * number_of_frames as usize)
+                        .collect()
+                } else {
+                    data.to_vec()
+                }
             }
             DicomValue::Sequence(..) => InvalidPixelDataSnafu.fail()?,
         };
-
         Ok(DecodedPixelData {
             data: Cow::from(decoded_pixel_data),
             cols: cols.into(),
@@ -2398,7 +2526,7 @@ where
                 let frame_size = if bits_allocated == 1 {
                     frame_samples / 8
                 } else {
-                    frame_samples * ((bits_allocated as usize + 7) / 8)
+                    frame_samples * (bits_allocated.div_ceil(8) as usize)
                 };
                 let frame_offset = frame_size * (frame as usize);
 
@@ -2410,7 +2538,7 @@ where
                     },
                 )?;
 
-                let pixel_data = if bits_allocated == 1 {
+                if bits_allocated == 1 {
                     // Map every bit in each byte to a separate byte of either 0 or 255
                     frame_data
                         .iter()
@@ -2419,9 +2547,7 @@ where
                         .collect()
                 } else {
                     frame_data.to_vec()
-                };
-
-                pixel_data
+                }
             }
             DicomValue::Sequence(..) => InvalidPixelDataSnafu.fail()?,
         };
@@ -2444,6 +2570,14 @@ where
             voi_lut_sequence,
             enforce_frame_fg_vm_match: false,
         })
+    }
+
+    fn decode_overlays(&self) -> Result<Vec<OverlayPlane>> {
+        overlay::decode_overlays(self)
+    }
+
+    fn decode_overlay(&self, index: u8) -> Result<Option<OverlayPlane>> {
+        overlay::decode_overlay_group(self, 0x6000 + 2 * index as u16)
     }
 }
 
@@ -2524,8 +2658,9 @@ mod tests {
         assert_eq!(ndarray[[0, 127, 127, 0]], 0x038D);
     }
 
-    /// conversion of a 16-bit image to a vector of 16-bit processed pixel values
-    /// takes advantage of the output's full spectrum
+    /// Conversion of a 16-bit image to a vector of 16-bit processed pixel values
+    /// when the image does not provide VOI LUT transform properties
+    /// takes advantage of the output's full spectrum.
     #[test]
     fn test_to_vec_16bit_to_window() {
         let test_file = dicom_test_files::path("pydicom/CT_small.dcm").unwrap();
@@ -2533,7 +2668,9 @@ mod tests {
 
         let decoded = obj.decode_pixel_data().unwrap();
         let options = ConvertOptions::new()
+            // will default to intercept = 1 and slope = 1
             .with_modality_lut(ModalityLutOption::Default)
+            // no window levels, so it will normalize
             .with_voi_lut(VoiLutOption::First);
         let values = decoded.to_vec_with_options::<u16>(&options).unwrap();
 
@@ -2695,15 +2832,18 @@ mod tests {
 
     #[test]
     #[ignore = "test is unsound"]
-    fn test_can_read_deflated(){
-        
-        let path = dicom_test_files::path("pydicom/image_dfl.dcm").expect("test DICOM file should exist");
-    
+    fn test_can_read_deflated() {
+        let path =
+            dicom_test_files::path("pydicom/image_dfl.dcm").expect("test DICOM file should exist");
+
         // should read preamble even though it's from a reader
         let obj = open_file(path.clone()).expect("Should read file");
-    
+
         let res = obj.decode_pixel_data().expect("Should decode pixel data.");
-        assert_eq!(res.to_vec::<u8>().unwrap().len(), (res.rows() as usize * res.columns() as usize));
+        assert_eq!(
+            res.to_vec::<u8>().unwrap().len(),
+            (res.rows() as usize * res.columns() as usize)
+        );
         let mut buf = Vec::<u8>::new();
         obj.write_all(&mut buf).expect("Should write deflated");
 
@@ -2758,6 +2898,34 @@ mod tests {
             assert_eq!(values[49 * columns * 3 + 16 * 3 + 1], 0);
             // 16,49,b
             assert_eq!(values[49 * columns * 3 + 16 * 3 + 2], 255);
+        }
+
+        /// The same 8-bit MONOCHROME2 image,
+        /// in RLE Lossless and native uncompressed,
+        /// should decode to the exact same pixel data sample values.
+        #[cfg(feature = "rle")]
+        #[test]
+        fn test_native_decoding_pixel_data_rle_8bit_monochrome() {
+            use crate::PixelDecoder as _;
+
+            let rle = dicom_test_files::path("pydicom/OBXXXX1A_rle.dcm").unwrap();
+            let native = dicom_test_files::path("pydicom/OBXXXX1A.dcm").unwrap();
+            let rle = dicom_object::open_file(&rle).unwrap();
+            let native = dicom_object::open_file(&native).unwrap();
+
+            let rle_pixeldata = rle.decode_pixel_data().unwrap();
+            let native_pixeldata = native.decode_pixel_data().unwrap();
+            assert!(
+                rle_pixeldata.data() == native_pixeldata.data(),
+                "RLE samples differ from native"
+            );
+
+            let rle_pixeldata = rle.decode_pixel_data_frame(0).unwrap();
+            let native_pixeldata = native.decode_pixel_data_frame(0).unwrap();
+            assert!(
+                rle_pixeldata.data() == native_pixeldata.data(),
+                "RLE samples differ from native"
+            );
         }
 
         #[cfg(feature = "ndarray")]
@@ -3074,7 +3242,38 @@ mod tests {
 
     #[cfg(feature = "image")]
     #[test]
-    fn test_1bit_image_decoding() {
+    fn test_1bit_image_decoding_data() {
+        use crate::PixelDecoder as _;
+        use std::path::Path;
+
+        let test_file =
+            dicom_test_files::path("pydicom/liver.dcm").expect("test DICOM file should exist");
+        let obj = dicom_object::open_file(test_file).unwrap();
+        let pixel_data = obj.decode_pixel_data().unwrap();
+
+        assert_eq!(pixel_data.number_of_frames(), 3, "expected 3 frames");
+
+        let output_dir = Path::new("../target/dicom_test_files/_out/test_1bit_image_decoding");
+        std::fs::create_dir_all(output_dir).unwrap();
+
+        for idx in 0..=2 {
+            let image = pixel_data.to_dynamic_image(idx).unwrap();
+            let image_path = output_dir.join(format!(
+                "{}-image-{}.png",
+                Path::new("pydicom/liver.dcm")
+                    .file_stem()
+                    .unwrap()
+                    .to_str()
+                    .unwrap(),
+                idx,
+            ));
+            image.save(image_path).unwrap();
+        }
+    }
+
+    #[cfg(feature = "image")]
+    #[test]
+    fn test_1bit_image_decoding_data_frame() {
         use crate::PixelDecoder as _;
         use std::path::Path;
 
@@ -3082,23 +3281,25 @@ mod tests {
             dicom_test_files::path("pydicom/liver.dcm").expect("test DICOM file should exist");
         println!("Parsing pixel data for {}", test_file.display());
         let obj = dicom_object::open_file(test_file).unwrap();
-        let pixel_data = obj.decode_pixel_data_frame(0).unwrap();
-        let output_dir =
-            Path::new("../target/dicom_test_files/_out/test_1bit_image_decoding");
+        let output_dir = Path::new("../target/dicom_test_files/_out/test_1bit_image_decoding");
         std::fs::create_dir_all(output_dir).unwrap();
 
-        assert_eq!(pixel_data.number_of_frames(), 1, "expected 1 frame only");
+        for idx in 0..=2 {
+            let pixel_data = obj.decode_pixel_data_frame(idx).unwrap();
 
-        let image = pixel_data.to_dynamic_image(0).unwrap();
-        let image_path = output_dir.join(format!(
-            "{}-{}.png",
-            Path::new("pydicom/liver.dcm")
-                .file_stem()
-                .unwrap()
-                .to_str()
-                .unwrap(),
-            0,
-        ));
-        image.save(image_path).unwrap();
+            assert_eq!(pixel_data.number_of_frames(), 1, "expected 1 frame only");
+
+            let image = pixel_data.to_dynamic_image(0).unwrap();
+            let image_path = output_dir.join(format!(
+                "{}-frame-{}.png",
+                Path::new("pydicom/liver.dcm")
+                    .file_stem()
+                    .unwrap()
+                    .to_str()
+                    .unwrap(),
+                idx
+            ));
+            image.save(image_path).unwrap();
+        }
     }
 }

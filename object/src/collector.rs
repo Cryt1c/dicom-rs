@@ -110,29 +110,32 @@ use std::{
 };
 
 use dicom_core::{
-    header::HasLength,
-    value::{PixelFragmentSequence, C},
     DataDictionary, DataElement, DicomValue, Length, Tag, VR,
+    header::HasLength,
+    value::{C, PixelFragmentSequence},
 };
-use dicom_dictionary_std::{tags, StandardDataDictionary};
-use dicom_encoding::{decode::DecodeFrom, TransferSyntaxIndex};
+use dicom_dictionary_std::{StandardDataDictionary, tags};
+use dicom_encoding::{TransferSyntaxIndex, decode::DecodeFrom};
 use dicom_parser::{
-    dataset::{
-        lazy_read::{LazyDataSetReader, LazyDataSetReaderOptions},
-        read::OddLengthStrategy,
-        DataToken, LazyDataToken,
-    },
     DynStatefulDecoder, StatefulDecode, StatefulDecoder,
+    dataset::{
+        DataToken, LazyDataToken,
+        lazy_read::{LazyDataSetReader, LazyDataSetReaderOptions},
+    },
 };
 use dicom_transfer_syntax_registry::TransferSyntaxRegistry;
-use snafu::prelude::*;
 use snafu::Backtrace;
+use snafu::prelude::*;
 
 use crate::{
+    FileMetaTable, InMemDicomObject,
     file::ReadPreamble,
     mem::{InMemElement, InMemFragment},
-    FileMetaTable, InMemDicomObject,
 };
+
+// re-export parsing options in public API
+pub use dicom_parser::dataset::read::OddLengthStrategy;
+pub use dicom_parser::stateful::decode::CharacterSetOverride;
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 
@@ -234,6 +237,8 @@ pub struct DicomCollectorOptions<D = StandardDataDictionary, R = TransferSyntaxR
     read_preamble: ReadPreamble,
     /// How to handle odd-lengthed data elements
     odd_length: OddLengthStrategy,
+    /// Override for how text should be decoded
+    charset_override: CharacterSetOverride,
 }
 
 impl DicomCollectorOptions {
@@ -257,6 +262,7 @@ impl<D, R> DicomCollectorOptions<D, R> {
             ts_hint: self.ts_hint,
             read_preamble: self.read_preamble,
             odd_length: self.odd_length,
+            charset_override: self.charset_override,
         }
     }
 
@@ -273,6 +279,7 @@ impl<D, R> DicomCollectorOptions<D, R> {
             ts_hint: self.ts_hint,
             read_preamble: self.read_preamble,
             odd_length: self.odd_length,
+            charset_override: self.charset_override,
         }
     }
 
@@ -300,6 +307,12 @@ impl<D, R> DicomCollectorOptions<D, R> {
         self
     }
 
+    /// Set how text of specific value representations should be decoded
+    pub fn charset_override(mut self, option: CharacterSetOverride) -> Self {
+        self.charset_override = option;
+        self
+    }
+
     /// Proceed with opening a file for DICOM collecting.
     pub fn open_file(
         self,
@@ -312,7 +325,12 @@ impl<D, R> DicomCollectorOptions<D, R> {
         let reader = BufReader::new(File::open(filename).context(OpenFileSnafu { filename })?);
 
         Ok(DicomCollector {
-            source: CollectionSource::new(reader, self.ts_index, self.odd_length),
+            source: CollectionSource::new(
+                reader,
+                self.ts_index,
+                self.odd_length,
+                self.charset_override,
+            ),
             dictionary: self.dict,
             ts_hint: self.ts_hint,
             file_meta: None,
@@ -328,7 +346,12 @@ impl<D, R> DicomCollectorOptions<D, R> {
         R: TransferSyntaxIndex,
     {
         DicomCollector {
-            source: CollectionSource::new(reader, self.ts_index, self.odd_length),
+            source: CollectionSource::new(
+                reader,
+                self.ts_index,
+                self.odd_length,
+                self.charset_override,
+            ),
             dictionary: self.dict,
             ts_hint: self.ts_hint,
             file_meta: None,
@@ -347,6 +370,8 @@ enum CollectionSource<S, R> {
         /// the strategy for reading odd-lengthed data elements
         /// (needs to be retained until a parser is constructed)
         odd_length: OddLengthStrategy,
+        /// override for how text should be decodedf
+        charset_override: CharacterSetOverride,
     },
     Parser(LazyDataSetReader<DynStatefulDecoder<S>>),
 }
@@ -361,10 +386,12 @@ where
                 reader,
                 ts_index,
                 odd_length,
+                charset_override,
             } => f
                 .debug_struct("Raw")
                 .field("ts_index", ts_index)
                 .field("odd_length", odd_length)
+                .field("charset_override", charset_override)
                 .field(
                     "reader",
                     &match reader {
@@ -383,11 +410,17 @@ where
     S: Read + Seek,
     R: TransferSyntaxIndex,
 {
-    fn new(raw_source: S, ts_index: R, odd_length: OddLengthStrategy) -> Self {
+    fn new(
+        raw_source: S,
+        ts_index: R,
+        odd_length: OddLengthStrategy,
+        charset_override: CharacterSetOverride,
+    ) -> Self {
         CollectionSource::Raw {
             reader: Some(raw_source),
             ts_index,
             odd_length,
+            charset_override,
         }
     }
 
@@ -413,6 +446,7 @@ where
                 reader: src,
                 ts_index,
                 odd_length,
+                charset_override,
             } => {
                 let src = src.take().unwrap();
 
@@ -425,6 +459,7 @@ where
 
                 let mut options = LazyDataSetReaderOptions::default();
                 options.odd_length = *odd_length;
+                options.charset_override = *charset_override;
                 *self = CollectionSource::Parser(
                     LazyDataSetReader::new_with_ts_options(src, ts, options)
                         .context(CreateParserSnafu)?,
@@ -520,7 +555,12 @@ where
     /// The transfer syntax is guessed from the file meta group data set.
     pub fn new(reader: BufReader<S>) -> Self {
         DicomCollector {
-            source: CollectionSource::new(reader, TransferSyntaxRegistry, Default::default()),
+            source: CollectionSource::new(
+                reader,
+                TransferSyntaxRegistry,
+                Default::default(),
+                Default::default(),
+            ),
             dictionary: StandardDataDictionary,
             ts_hint: None,
             file_meta: None,
@@ -539,7 +579,12 @@ where
         transfer_syntax: impl Into<Cow<'static, str>>,
     ) -> Self {
         DicomCollector {
-            source: CollectionSource::new(reader, TransferSyntaxRegistry, Default::default()),
+            source: CollectionSource::new(
+                reader,
+                TransferSyntaxRegistry,
+                Default::default(),
+                Default::default(),
+            ),
             dictionary: StandardDataDictionary,
             ts_hint: Some(transfer_syntax.into()),
             file_meta: None,
@@ -591,7 +636,12 @@ where
     /// The standard transfer syntax registry is used.
     fn new_with_dict(reader: BufReader<S>, dictionary: D) -> Self {
         DicomCollector {
-            source: CollectionSource::new(reader, TransferSyntaxRegistry, Default::default()),
+            source: CollectionSource::new(
+                reader,
+                TransferSyntaxRegistry,
+                Default::default(),
+                Default::default(),
+            ),
             dictionary,
             ts_hint: None,
             file_meta: None,
@@ -706,13 +756,13 @@ where
     /// ```no_run
     /// # use dicom_object::{DicomCollector, FileMetaTable, InMemDicomObject};
     /// let mut collector = DicomCollector::open_file("file.dcm")?;
-    /// 
+    ///
     /// // read_file_meta() only returns a reference
     /// let _: &FileMetaTable  = collector.read_file_meta()?;
     /// // read some data from the main data set
     /// let mut main_dataset = InMemDicomObject::new_empty();
-    /// collector.read_dataset_up_to_pixeldata(&mut main_dataset)?; 
-    /// 
+    /// collector.read_dataset_up_to_pixeldata(&mut main_dataset)?;
+    ///
     /// // take the table out of the collector,
     /// // as it is no longer needed
     /// let file_meta: FileMetaTable = collector.take_file_meta()
@@ -744,7 +794,15 @@ where
             self.source.parser()
         };
 
-        Self::collect_to_object(&mut self.state, parser, false, None, to, &self.dictionary)
+        Self::collect_to_object(
+            &mut self.state,
+            parser,
+            false,
+            None,
+            None,
+            to,
+            &self.dictionary,
+        )
     }
 
     /// Read a DICOM data set until it reaches the given stop tag
@@ -773,6 +831,7 @@ where
             parser,
             false,
             Some(stop_tag),
+            None,
             to,
             &self.dictionary,
         )
@@ -991,7 +1050,7 @@ where
         &mut self,
         mut pred: impl FnMut(
             &LazyDataToken<
-                &mut StatefulDecoder<Box<(dyn DecodeFrom<BufReader<S>> + 'static)>, BufReader<S>>,
+                &mut StatefulDecoder<Box<dyn DecodeFrom<BufReader<S>> + 'static>, BufReader<S>>,
             >,
         ) -> bool,
     ) -> Result<bool> {
@@ -1018,11 +1077,20 @@ where
         token_src: &mut LazyDataSetReader<DynStatefulDecoder<BufReader<S>>>,
         in_item: bool,
         read_until: Option<Tag>,
+        read_to: Option<Tag>,
         to: &mut InMemDicomObject<D>,
         dict: &D,
     ) -> Result<()> {
         let mut elements = Vec::new();
-        Self::collect_elements(state, token_src, in_item, read_until, &mut elements, dict)?;
+        Self::collect_elements(
+            state,
+            token_src,
+            in_item,
+            read_until,
+            read_to,
+            &mut elements,
+            dict,
+        )?;
         to.extend(elements);
         Ok(())
     }
@@ -1033,6 +1101,7 @@ where
         token_src: &mut LazyDataSetReader<DynStatefulDecoder<BufReader<S>>>,
         in_item: bool,
         read_until: Option<Tag>,
+        read_to: Option<Tag>,
         to: &mut Vec<DataElement<InMemDicomObject<D>>>,
         dict: &D,
     ) -> Result<()> {
@@ -1041,11 +1110,15 @@ where
             let token = token.clone();
             let elem = match token {
                 DataToken::PixelSequenceStart => {
-                    // stop reading if reached `read_until` tag
+                    // stop reading if reached `read_until` tag (exclusive)
                     if read_until
                         .map(|t| t <= Tag(0x7fe0, 0x0010))
                         .unwrap_or(false)
                     {
+                        break;
+                    }
+                    // stop reading if exceeded `read_to` tag (inclusive)
+                    if read_to.map(|t| t < Tag(0x7fe0, 0x0010)).unwrap_or(false) {
                         break;
                     }
                     *state = CollectorState::InPixelData;
@@ -1054,8 +1127,12 @@ where
                     DataElement::new(Tag(0x7fe0, 0x0010), VR::OB, value)
                 }
                 DataToken::ElementHeader(header) => {
-                    // stop reading if reached `read_until` tag
+                    // stop reading if reached `read_until` tag (exclusive)
                     if read_until.map(|t| t <= header.tag).unwrap_or(false) {
+                        break;
+                    }
+                    // stop reading if exceeded `read_to` tag (inclusive)
+                    if read_to.map(|t| t < header.tag).unwrap_or(false) {
                         break;
                     }
 
@@ -1084,8 +1161,12 @@ where
                     }
                 }
                 DataToken::SequenceStart { tag, len } => {
-                    // stop reading if reached `read_until` tag
+                    // stop reading if reached `read_until` tag (exclusive)
                     if read_until.map(|t| t <= tag).unwrap_or(false) {
+                        break;
+                    }
+                    // stop reading if exceeded `read_to` tag (inclusive)
+                    if read_to.map(|t| t < tag).unwrap_or(false) {
                         break;
                     }
                     *state = CollectorState::InDataset;
@@ -1119,7 +1200,7 @@ where
                         token: token.clone(),
                     }
                     .fail()
-                    .map_err(From::from)
+                    .map_err(From::from);
                 }
             };
             to.push(elem);
@@ -1154,6 +1235,7 @@ where
                         decoder
                             .read_u32_to_vec(len, &mut table)
                             .context(ReadItemSnafu)?;
+                        offset_table = Some(table);
                         first = false;
                     } else {
                         let mut data = Vec::new();
@@ -1204,7 +1286,7 @@ where
             match token.context(ReadTokenSnafu)? {
                 LazyDataToken::ItemStart { len: _ } => {
                     let mut obj = InMemDicomObject::new_empty_with_dict(dict.clone());
-                    Self::collect_to_object(state, token_src, true, None, &mut obj, dict)?;
+                    Self::collect_to_object(state, token_src, true, None, None, &mut obj, dict)?;
                     items.push(obj);
                 }
                 LazyDataToken::SequenceEnd => {
@@ -1223,14 +1305,15 @@ where
 mod tests {
     use std::io::{BufReader, Write};
 
-    use dicom_core::{prelude::*, value::DataSetSequence, PrimitiveValue};
-    use dicom_dictionary_std::{tags, uids, StandardDataDictionary};
+    use dicom_core::{PrimitiveValue, prelude::*, value::DataSetSequence};
+    use dicom_dictionary_std::{StandardDataDictionary, tags, uids};
     use dicom_encoding::TransferSyntaxIndex;
     use dicom_parser::dataset::read::OddLengthStrategy;
     use dicom_transfer_syntax_registry::TransferSyntaxRegistry;
 
     use crate::{
-        file::ReadPreamble, DicomCollectorOptions, FileMetaTable, FileMetaTableBuilder, InMemDicomObject
+        DicomCollectorOptions, FileMetaTable, FileMetaTableBuilder, InMemDicomObject,
+        file::ReadPreamble,
     };
 
     use super::DicomCollector;
@@ -1389,17 +1472,23 @@ mod tests {
 
         let reader = BufReader::new(std::io::Cursor::new(&encoded));
         let mut collector = DicomCollector::new(reader);
-        
+
         // read_file_meta() only returns a reference
-        let _: &FileMetaTable  = collector.read_file_meta().unwrap();
+        let _: &FileMetaTable = collector.read_file_meta().unwrap();
         // read some data from the main data set
         let mut main_dataset = InMemDicomObject::new_empty();
-        collector.read_dataset_up_to_pixeldata(&mut main_dataset).unwrap(); 
-        
+        collector
+            .read_dataset_up_to_pixeldata(&mut main_dataset)
+            .unwrap();
+
         // can reliably take the table out of the collector
-        let file_meta: FileMetaTable = collector.take_file_meta()
+        let file_meta: FileMetaTable = collector
+            .take_file_meta()
             .expect("should have file meta info");
-        assert_eq!(file_meta.media_storage_sop_instance_uid(), "2.25.248821220596756482508841578490676982546");
+        assert_eq!(
+            file_meta.media_storage_sop_instance_uid(),
+            "2.25.248821220596756482508841578490676982546"
+        );
 
         // can still read more data afterwards
         let mut fragment_data = Vec::new();
@@ -1701,9 +1790,107 @@ mod tests {
         assert_eq!(&fragment[664 + 659..], &[0x00, 0x9D, 0x00, 0x9D, 0x00]);
 
         // no more fragments
-        assert!(collector
-            .read_next_fragment(&mut fragment)
-            .expect("attempt to read the next fragment should not have failed")
-            .is_none());
+        assert!(
+            collector
+                .read_next_fragment(&mut fragment)
+                .expect("attempt to read the next fragment should not have failed")
+                .is_none()
+        );
+    }
+
+    // test loading portions of a DICOM in steps with the collector API
+    #[test]
+    fn test_lazy_dicom_read() {
+        let file_path_buf = dicom_test_files::path("WG04/J2KR/MG1_J2KR")
+            .expect("should be able to retrieve test file");
+
+        let filename = file_path_buf
+            .to_str()
+            .expect("should be able to retrieve test file");
+
+        // instantiate collector and read fmi
+        let mut collector = DicomCollector::open_file(filename)
+            .expect("should be able to open the test file with the collector");
+        let _fmi = collector.read_file_meta();
+
+        // read the dicom up to the pixel data
+        let mut obj = InMemDicomObject::new_empty();
+        collector
+            .read_dataset_up_to_pixeldata(&mut obj)
+            .expect("should be able to read up to the PixelData element");
+
+        // read the rest of the dicom
+        collector
+            .read_dataset_to_end(&mut obj)
+            .expect("should be able to read the rest of the DICOM");
+    }
+
+    /// read the full DICOM file,
+    /// checking that everything is in it as expected
+    #[test]
+    fn test_read_to_end() {
+        let filename = dicom_test_files::path("pydicom/SC_rgb_rle_2frame.dcm").unwrap();
+
+        let mut collector = DicomCollector::open_file(filename).unwrap();
+
+        let fmi = collector
+            .read_file_meta()
+            .expect("should read file meta info successfully");
+
+        assert_eq!(fmi.transfer_syntax(), uids::RLE_LOSSLESS);
+
+        let mut dset = InMemDicomObject::new_empty();
+        collector
+            .read_dataset_to_end(&mut dset)
+            .expect("should read dataset successfully");
+
+        // inspect a few attributes
+        assert_eq!(
+            dset.get(tags::SPECIFIC_CHARACTER_SET)
+                .unwrap()
+                .to_str()
+                .unwrap(),
+            "ISO_IR 192"
+        );
+        assert_eq!(dset.get(tags::MODALITY).unwrap().to_str().unwrap(), "OT");
+        assert_eq!(dset.get(tags::PATIENT_ID).unwrap().to_str().unwrap(), "ID1");
+        assert_eq!(
+            dset.get(tags::PHOTOMETRIC_INTERPRETATION)
+                .unwrap()
+                .to_str()
+                .unwrap(),
+            "RGB"
+        );
+
+        assert_eq!(
+            dset.get(tags::NUMBER_OF_FRAMES)
+                .unwrap()
+                .to_int::<u32>()
+                .unwrap(),
+            2
+        );
+
+        // inspect the basic offset table
+        let pixel_data = dset
+            .get(tags::PIXEL_DATA)
+            .expect("Should have pixel data")
+            .value();
+        let DicomValue::PixelSequence(seq) = pixel_data else {
+            panic!("Expected encapsulated pixel data");
+        };
+        let bot = seq.offset_table();
+        assert_eq!(bot.len(), 2);
+        assert_eq!(&bot, &[0x0000, 0x02A0]);
+
+        // inspect the other fragments
+
+        let fragments = seq.fragments();
+
+        assert_eq!(fragments.len(), 2);
+        assert_eq!(fragments[0].len(), 664);
+
+        // inspect a few bytes just to be sure
+        assert_eq!(&fragments[0][0..5], &[0x03, 0x00, 0x00, 0x00, 0x40]);
+        assert_eq!(&fragments[1][0..5], &[0x03, 0x00, 0x00, 0x00, 0x40]);
     }
 }

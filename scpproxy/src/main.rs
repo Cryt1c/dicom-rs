@@ -1,8 +1,8 @@
 use bytes::BytesMut;
-use clap::{crate_version, value_parser, Arg, ArgAction, Command};
-use dicom_ul::association::client::get_client_pdu;
+use clap::{Arg, ArgAction, Command, crate_version, value_parser};
+use dicom_ul::association::read_pdu_from_wire;
 use dicom_ul::pdu::writer::write_pdu;
-use dicom_ul::pdu::Pdu;
+use dicom_ul::pdu::{Pdu, UserVariableItem};
 use snafu::{Backtrace, OptionExt, Report, ResultExt, Snafu, Whatever};
 use std::io::Write;
 use std::net::{Shutdown, TcpListener, TcpStream};
@@ -50,7 +50,7 @@ enum Error {
 }
 
 #[derive(Debug, Copy, Clone, Eq, PartialEq, Hash)]
-pub enum ProviderType {
+enum ProviderType {
     /// Service class provider
     Scp,
     /// Service class user
@@ -58,15 +58,16 @@ pub enum ProviderType {
 }
 
 #[derive(Debug)]
-pub enum ThreadMessage {
+enum ThreadMessage {
     SendPdu {
         to: ProviderType,
         pdu: Pdu,
     },
     ReadErr {
         from: ProviderType,
-        err: dicom_ul::association::client::Error,
+        err: dicom_ul::association::Error,
     },
+    #[allow(dead_code)]
     WriteErr {
         from: ProviderType,
         err: dicom_ul::pdu::WriteError,
@@ -75,6 +76,8 @@ pub enum ThreadMessage {
         initiator: ProviderType,
     },
 }
+
+const LARGE_PDU_SIZE: u32 = 131_066;
 
 fn run(
     scu_stream: &mut TcpStream,
@@ -95,12 +98,30 @@ fn run(
 
             {
                 let mut reader = scu_stream.try_clone().context(CloneSocketSnafu)?;
-                let mut buf = BytesMut::with_capacity(max_pdu_length as usize);
+                let mut buf = BytesMut::with_capacity(max_pdu_length.min(LARGE_PDU_SIZE) as usize);
                 let message_tx = message_tx.clone();
                 scu_reader_thread = thread::spawn(move || {
                     loop {
-                        match get_client_pdu(&mut reader, &mut buf, max_pdu_length, strict) {
+                        match read_pdu_from_wire(&mut reader, &mut buf, max_pdu_length, strict) {
                             Ok(pdu) => {
+                                let pdu = match pdu {
+                                    Pdu::AssociationRQ(mut rq) => {
+                                        // tamper A-ASSOCIATE-RQ
+                                        // so that max PDU length does not exceed
+                                        // the number established by the proxy
+                                        if let Some(UserVariableItem::MaxLength(m)) =
+                                            rq.user_variables.iter_mut().find(|var| {
+                                                matches!(var, UserVariableItem::MaxLength(_))
+                                            })
+                                        {
+                                            *m = (*m).min(max_pdu_length);
+                                        }
+
+                                        Pdu::AssociationRQ(rq)
+                                    }
+                                    pdu => pdu,
+                                };
+
                                 message_tx
                                     .send(ThreadMessage::SendPdu {
                                         to: ProviderType::Scp,
@@ -108,7 +129,7 @@ fn run(
                                     })
                                     .context(SendMessageSnafu)?;
                             }
-                            Err(dicom_ul::association::client::Error::ConnectionClosed) => {
+                            Err(dicom_ul::association::Error::ConnectionClosed { .. }) => {
                                 message_tx
                                     .send(ThreadMessage::Shutdown {
                                         initiator: ProviderType::Scu,
@@ -134,11 +155,29 @@ fn run(
 
             {
                 let mut reader = scp_stream.try_clone().context(CloneSocketSnafu)?;
-                let mut buf = BytesMut::with_capacity(max_pdu_length as usize);
+                let mut buf = BytesMut::with_capacity(max_pdu_length.min(LARGE_PDU_SIZE) as usize);
                 scp_reader_thread = thread::spawn(move || {
                     loop {
-                        match get_client_pdu(&mut reader, &mut buf, max_pdu_length, strict) {
+                        match read_pdu_from_wire(&mut reader, &mut buf, max_pdu_length, strict) {
                             Ok(pdu) => {
+                                let pdu = match pdu {
+                                    Pdu::AssociationAC(mut rq) => {
+                                        // tamper A-ASSOCIATE-AC
+                                        // so that max PDU length does not exceed
+                                        // the number established by the proxy
+                                        if let Some(UserVariableItem::MaxLength(m)) =
+                                            rq.user_variables.iter_mut().find(|var| {
+                                                matches!(var, UserVariableItem::MaxLength(_))
+                                            })
+                                        {
+                                            *m = (*m).min(max_pdu_length);
+                                        }
+
+                                        Pdu::AssociationAC(rq)
+                                    }
+                                    pdu => pdu,
+                                };
+
                                 message_tx
                                     .send(ThreadMessage::SendPdu {
                                         to: ProviderType::Scu,
@@ -146,7 +185,7 @@ fn run(
                                     })
                                     .context(SendMessageSnafu)?;
                             }
-                            Err(dicom_ul::association::client::Error::ConnectionClosed) => {
+                            Err(dicom_ul::association::Error::ConnectionClosed { .. }) => {
                                 message_tx
                                     .send(ThreadMessage::Shutdown {
                                         initiator: ProviderType::Scp,
@@ -169,7 +208,8 @@ fn run(
                     Ok(())
                 });
             }
-            let mut buffer: Vec<u8> = Vec::with_capacity(max_pdu_length as usize);
+            let mut buffer: Vec<u8> =
+                Vec::with_capacity(max_pdu_length.min(LARGE_PDU_SIZE) as usize);
 
             loop {
                 let message = message_rx.recv().context(ReceiveMessageSnafu)?;
@@ -261,7 +301,7 @@ fn command() -> Command {
         )
         .arg(
             Arg::new("strict")
-                .help("Enforce max PDU length")
+                .help("Cut connection if maximum PDU length is not met")
                 .short('s')
                 .long("strict")
                 .action(ArgAction::SetTrue),
@@ -275,11 +315,11 @@ fn command() -> Command {
         )
         .arg(
             Arg::new("max-pdu-length")
-                .help("Maximum PDU length")
+                .help("The maximum PDU length to enforce")
                 .short('m')
                 .long("max-pdu-length")
-                .value_parser(value_parser!(u32).range(4096..=131_072))
-                .default_value("16384"),
+                .value_parser(value_parser!(u32).range(1018..))
+                .default_value("16378"),
         )
 }
 

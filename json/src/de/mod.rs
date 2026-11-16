@@ -4,8 +4,8 @@ use std::{marker::PhantomData, str::FromStr};
 
 use crate::DicomJson;
 use dicom_core::{
-    value::{InMemFragment, Value, C},
     DataDictionary, DataElement, PrimitiveValue, Tag, VR,
+    value::{C, InMemFragment, Value},
 };
 use dicom_object::InMemDicomObject;
 use serde::de::{Deserialize, DeserializeOwned, Error as _, Visitor};
@@ -170,7 +170,7 @@ where
                     value = Some(map.next_value()?);
                 }
                 "InlineBinary" => {
-                    if values.is_some() {
+                    if value.is_some() {
                         return Err(A::Error::custom(
                             "\"InlineBinary\" conflicts with \"Value\"",
                         ));
@@ -186,7 +186,7 @@ where
                     inline_binary = Some(val);
                 }
                 "BulkDataURI" => {
-                    if values.is_some() {
+                    if value.is_some() {
                         return Err(A::Error::custom("\"BulkDataURI\" conflicts with \"Value\""));
                     }
 
@@ -351,9 +351,14 @@ where
             }
         }
 
-        let value = match (values, inline_binary) {
-            (None, None) => PrimitiveValue::Empty.into(),
-            (None, Some(inline_binary)) => {
+        let value = match (values, vr, inline_binary) {
+            (None, _, None) => PrimitiveValue::Empty.into(),
+            (
+                None,
+                // PS3.19 Table A.1.5-2
+                VR::OB | VR::OD | VR::OF | VR::OL | VR::OV | VR::OW | VR::UN,
+                Some(inline_binary),
+            ) => {
                 // decode from Base64
                 use base64::Engine;
                 let data = base64::engine::general_purpose::STANDARD
@@ -361,8 +366,15 @@ where
                     .map_err(|_| A::Error::custom("inline binary data is not valid base64"))?;
                 PrimitiveValue::from(data).into()
             }
-            (Some(values), None) => values,
-            _ => unreachable!(),
+            (None, vr, Some(_inline_binary)) => {
+                return Err(A::Error::custom(format!(
+                    "value of VR {vr} should not be encoded in InlineBinary"
+                )));
+            }
+            (Some(values), _, None) => values,
+            (Some(_), _, Some(_)) => unreachable!(
+                "conflict between InlineBinary and Value should have already been checked"
+            ),
         };
 
         Ok(JsonDataElement {
@@ -419,7 +431,7 @@ impl<'de> Deserialize<'de> for DicomJson<Tag> {
 #[cfg(test)]
 mod tests {
     use super::from_str;
-    use dicom_core::{dicom_value, DataElement, Tag, VR};
+    use dicom_core::{DataElement, Tag, VR, dicom_value};
     use dicom_object::InMemDicomObject;
     use num_traits::Float;
 
@@ -427,10 +439,12 @@ mod tests {
     /// It needs a special comparison for NAN values since assert_eq will not match.
     fn assert_float_slice_eq<T: Float>(actual: &[T], expected: &[T]) {
         assert_eq!(actual.len(), expected.len());
-        assert!(actual
-            .iter()
-            .zip(actual.iter())
-            .all(|(&a, &b)| (a == b) || (a.is_nan() && b.is_nan())));
+        assert!(
+            actual
+                .iter()
+                .zip(actual.iter())
+                .all(|(&a, &b)| (a == b) || (a.is_nan() && b.is_nan()))
+        );
     }
 
     #[test]
@@ -466,7 +480,10 @@ mod tests {
                 "vr": "PN",
                 "Value": [
                   {
-                    "Alphabetic": "^Bob^^Dr."
+                    "Alphabetic": "^Bob^^Dr.",
+                  },
+                  {
+                    "Ideographic": "月野^うさぎ",
                   }
                 ]
             },
@@ -588,5 +605,58 @@ mod tests {
         ];
 
         assert_float_slice_eq(&actual_values_multifloat_64, expected_values_multifloat_64);
+    }
+
+    #[test]
+    fn rejects_inline_binary_for_non_binary_vr() {
+        let serialized = serde_json::json!({
+            "00020001": {
+                "vr": "DS",
+                "InlineBinary": "AAE="
+            }
+        });
+
+        let res: Result<InMemDicomObject, _> = super::from_value(serialized);
+        let e = res.unwrap_err();
+        assert_eq!(e.classify(), serde_json::error::Category::Data);
+    }
+
+    #[test]
+    fn rejects_value_conflicts() {
+        let serialized = serde_json::json!({
+            "00020001": {
+                "vr": "DS",
+                "Value": [0, 1],
+                "InlineBinary": "AAE="
+            }
+        });
+
+        let res: Result<InMemDicomObject, _> = super::from_value(serialized);
+        let e = res.unwrap_err();
+        assert_eq!(e.classify(), serde_json::error::Category::Data);
+
+        let serialized = serde_json::json!({
+            "7FE00010": {
+                "vr": "OW",
+                "InlineBinary": "AAE=",
+                "BulkDataURI": "http://localhost:8042/dicom-web/instances/1.2.3.4.5/pixeldata"
+            }
+        });
+
+        let res: Result<InMemDicomObject, _> = super::from_value(serialized);
+        let e = res.unwrap_err();
+        assert_eq!(e.classify(), serde_json::error::Category::Data);
+
+        let serialized = serde_json::json!({
+            "00081010": {
+                "vr": "SH",
+                "Value": [ "RUSTATION" ],
+                "BulkDataURI": "http://localhost:8042/dicom-web/instances/1.2.3.4.5/station_name"
+            }
+        });
+
+        let res: Result<InMemDicomObject, _> = super::from_value(serialized);
+        let e = res.unwrap_err();
+        assert_eq!(e.classify(), serde_json::error::Category::Data);
     }
 }

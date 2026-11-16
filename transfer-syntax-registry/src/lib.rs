@@ -68,12 +68,14 @@
 //! | High-Throughput JPEG 2000 with RPCL Options (Lossless Only) | Cargo feature `openjp2` or `openjpeg-sys` | x |
 //! | High-Throughput JPEG 2000     | Cargo feature `openjp2` or `openjpeg-sys` | x |
 //! | JPIP HTJ2K Referenced Deflate | Cargo feature `deflate` | ✓ |
-//! | JPEG XL Lossless              | Cargo feature `jpegxl` | ✓ |
-//! | JPEG XL Recompression         | Cargo feature `jpegxl` | x |
-//! | JPEG XL                       | Cargo feature `jpegxl` | ✓ |
+//! | JPEG XL Lossless              | Cargo feature `jxl-oxide` | ✓ (Cargo feature `zune-jpegxl`) |
+//! | JPEG XL Recompression         | Cargo feature `jxl-oxide` | x |
+//! | JPEG XL                       | Cargo feature `jxl-oxide` | ✓ (Cargo feature `zune-jpegxl`) |
 //! | RLE Lossless                  | Cargo feature `rle` | x |
+//! | Deflated Image Frame          | Cargo feature `deflate` | ✓ |
 //!
-//! Cargo features behind `native` (`jpeg`, `rle`) are added by default.
+//! Cargo features behind `native` (`jpeg`, `rle`, `deflate`)
+//! are added by default in the [`dicom-pixeldata` crate][dicom-pixeldata].
 //! They provide implementations that are written in pure Rust
 //! and are likely available in all supported platforms without issues.
 //! Additional codecs are opt-in by enabling Cargo features,
@@ -83,7 +85,7 @@
 //! - `charls` provides support for JPEG-LS
 //!   by linking to the CharLS reference implementation,
 //!   which is written in C++.
-//!   No alternative JPEG-LS implementations are available at the moment. 
+//!   No alternative JPEG-LS implementations are available at the moment.
 //! - `openjpeg-sys` provides a binding to the OpenJPEG reference implementation,
 //!   which is written in C and is statically linked.
 //!   It may offer better performance than the pure Rust implementation,
@@ -92,8 +94,7 @@
 //! - `openjp2` provides a binding to a computer-translated Rust port of OpenJPEG.
 //!   Due to the nature of this crate,
 //!   it might not work on all modern platforms.
-//! - `jpegxl` adds JPEG XL support using `jxl-oxide` for decoding
-//!   and `zune-jpegxl` for encoding.
+//! - `jxl-oxide` and `zune-jpegxl` offer JPEG XL decoding and encoding.
 //!
 //! Transfer syntaxes which are not supported,
 //! either due to being unable to read the data set
@@ -104,17 +105,18 @@
 //! if using the inventory-based registry.
 //!
 //! [inventory]: https://docs.rs/inventory/0.3.15/inventory
+//! [dicom-pixeldata]: https://docs.rs/dicom-pixeldata
 
-use dicom_encoding::transfer_syntax::{
-    AdapterFreeTransferSyntax as Ts, Codec, TransferSyntaxIndex,
-};
+use dicom_encoding::transfer_syntax::{AdapterFreeTransferSyntax as Ts, Codec};
 use lazy_static::lazy_static;
-use std::collections::hash_map::Entry;
 use std::collections::HashMap;
+use std::collections::hash_map::Entry;
 use std::fmt;
 
-pub use dicom_encoding::TransferSyntax;
+pub use dicom_encoding::{TransferSyntax, TransferSyntaxIndex};
 pub mod entries;
+
+pub(crate) mod alloc;
 
 mod adapters;
 #[cfg(feature = "deflate")]
@@ -180,13 +182,19 @@ impl TransferSyntaxRegistryImpl {
                     // requirements, better keep it as a separate match arm for
                     // debugging purposes
                     (Codec::Dataset(None), Codec::EncapsulatedPixelData(_, _)) => {
-                        tracing::warn!("Inconsistent requirements for transfer syntax {}: `Dataset` cannot be replaced by `EncapsulatedPixelData`", ts.uid());
+                        tracing::warn!(
+                            "Inconsistent requirements for transfer syntax {}: `Dataset` cannot be replaced by `EncapsulatedPixelData`",
+                            ts.uid()
+                        );
                         false
                     }
                     // another weird one:
                     // the two codecs do not agree on requirements
                     (Codec::EncapsulatedPixelData(_, _), Codec::Dataset(None)) => {
-                        tracing::warn!("Inconsistent requirements for transfer syntax {}: `EncapsulatedPixelData` cannot be replaced by `Dataset`", ts.uid());
+                        tracing::warn!(
+                            "Inconsistent requirements for transfer syntax {}: `EncapsulatedPixelData` cannot be replaced by `Dataset`",
+                            ts.uid()
+                        );
                         false
                     }
                     // ignoring TS with less or equal implementation
@@ -238,11 +246,11 @@ lazy_static! {
 
     static ref REGISTRY: TransferSyntaxRegistryImpl = {
         let mut registry = TransferSyntaxRegistryImpl {
-            m: HashMap::with_capacity(32),
+            m: HashMap::with_capacity(64),
         };
 
         use self::entries::*;
-        let built_in_ts: [TransferSyntax; 45] = [
+        let built_in_ts: [TransferSyntax; 46] = [
             IMPLICIT_VR_LITTLE_ENDIAN.erased(),
             EXPLICIT_VR_LITTLE_ENDIAN.erased(),
             EXPLICIT_VR_BIG_ENDIAN.erased(),
@@ -288,6 +296,7 @@ lazy_static! {
             HEVC_H265_MAIN_PROFILE.erased(),
             HEVC_H265_MAIN_10_PROFILE.erased(),
             RLE_LOSSLESS.erased(),
+            DEFLATED_IMAGE_FRAME_COMPRESSION.erased(),
             SMPTE_ST_2110_20_UNCOMPRESSED_PROGRESSIVE.erased(),
             SMPTE_ST_2110_20_UNCOMPRESSED_INTERLACED.erased(),
             SMPTE_ST_2110_30_PCM.erased(),

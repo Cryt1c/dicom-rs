@@ -1,5 +1,5 @@
 //! Test suite for JPEG XL pixel data reading and writing
-#![cfg(feature = "jpegxl")]
+#![cfg(any(feature = "jxl-oxide", feature = "zune-jpegxl"))]
 
 mod adapters;
 
@@ -11,12 +11,14 @@ use std::{
 
 use adapters::TestDataObject;
 use dicom_core::value::PixelFragmentSequence;
-use dicom_encoding::{
-    adapters::{EncodeOptions, PixelDataReader, PixelDataWriter},
-    Codec,
-};
-use dicom_transfer_syntax_registry::entries::{JPEG_XL, JPEG_XL_LOSSLESS};
+use dicom_encoding::Codec;
 
+#[cfg(feature = "jxl-oxide")]
+use dicom_encoding::adapters::PixelDataReader;
+#[cfg(feature = "zune-jpegxl")]
+use dicom_encoding::adapters::{EncodeOptions, PixelDataWriter};
+
+#[cfg(feature = "jxl-oxide")]
 fn read_data_piece(test_file: impl AsRef<Path>, offset: u64, length: usize) -> Vec<u8> {
     let mut file = File::open(test_file).unwrap();
     // single fragment found in file data offset 0x6b6, 3314 bytes
@@ -26,6 +28,7 @@ fn read_data_piece(test_file: impl AsRef<Path>, offset: u64, length: usize) -> V
     buf
 }
 
+#[cfg(feature = "jxl-oxide")]
 fn check_rgb_pixel(pixels: &[u8], columns: u16, x: u16, y: u16, expected_pixel: [u8; 3]) {
     let i = (y as usize * columns as usize + x as usize) * 3;
     let got = [pixels[i], pixels[i + 1], pixels[i + 2]];
@@ -35,6 +38,7 @@ fn check_rgb_pixel(pixels: &[u8], columns: u16, x: u16, y: u16, expected_pixel: 
     );
 }
 
+#[cfg(feature = "jxl-oxide")]
 fn check_rgb_pixel_approx(pixels: &[u8], columns: u16, x: u16, y: u16, pixel: [u8; 3], margin: u8) {
     let i = (y as usize * columns as usize + x as usize) * 3;
 
@@ -59,6 +63,7 @@ fn check_rgb_pixel_approx(pixels: &[u8], columns: u16, x: u16, y: u16, pixel: [u
     );
 }
 
+#[cfg(feature = "jxl-oxide")]
 #[test]
 #[ignore]
 fn read_jpeg_xl_1() {
@@ -86,7 +91,9 @@ fn read_jpeg_xl_1() {
 
     // instantiate JpegAdapter and call decode_frame
 
-    let Codec::EncapsulatedPixelData(Some(adapter), _) = JPEG_XL.codec() else {
+    let Codec::EncapsulatedPixelData(Some(adapter), _) =
+        dicom_transfer_syntax_registry::entries::JPEG_XL.codec()
+    else {
         panic!("JPEG XL pixel data reader not found")
     };
 
@@ -114,6 +121,7 @@ fn read_jpeg_xl_1() {
     check_rgb_pixel_approx(&dest, 100, 16, 49, [4, 4, 226], err_margin);
 }
 
+#[cfg(feature = "jxl-oxide")]
 #[test]
 #[ignore]
 fn read_jpeg_xl_lossless_1() {
@@ -141,7 +149,9 @@ fn read_jpeg_xl_lossless_1() {
 
     // instantiate JpegAdapter and call decode_frame
 
-    let Codec::EncapsulatedPixelData(Some(adapter), _) = JPEG_XL.codec() else {
+    let Codec::EncapsulatedPixelData(Some(adapter), _) =
+        dicom_transfer_syntax_registry::entries::JPEG_XL.codec()
+    else {
         panic!("JPEG XL pixel data reader not found")
     };
 
@@ -168,6 +178,7 @@ fn read_jpeg_xl_lossless_1() {
 }
 
 /// writing to JPEG XL lossless and back should yield exactly the same pixel data
+#[cfg(all(feature = "jxl-oxide", feature = "zune-jpegxl"))]
 #[test]
 fn write_and_read_jpeg_xl() {
     let rows: u16 = 128;
@@ -219,7 +230,9 @@ fn write_and_read_jpeg_xl() {
 
     // fetch adapters for JPEG XL lossless
 
-    let Codec::EncapsulatedPixelData(Some(reader), Some(writer)) = JPEG_XL_LOSSLESS.codec() else {
+    let Codec::EncapsulatedPixelData(Some(reader), Some(writer)) =
+        dicom_transfer_syntax_registry::entries::JPEG_XL_LOSSLESS.codec()
+    else {
         panic!("JPEG XL pixel data adapters not found")
     };
 
@@ -252,6 +265,89 @@ fn write_and_read_jpeg_xl() {
         .decode_frame(&obj, 0, &mut decoded)
         .expect("JPEG XL frame decoding failed");
 
-    // compare pixels, lossless encoding should yield exactly the same data 
-    assert_eq!(samples, decoded , "pixel data mismatch");
+    // compare pixels, lossless encoding should yield exactly the same data
+    assert_eq!(samples, decoded, "pixel data mismatch");
+}
+
+/// writing to JPEG XL lossless multiple times
+/// should append each frame to the end of the output buffer
+#[cfg(feature = "zune-jpegxl")]
+#[test]
+fn write_append_jpeg_xl() {
+    let rows: u16 = 128;
+    let columns: u16 = 256;
+
+    // build some random RGB image
+    let mut samples = vec![0; rows as usize * columns as usize * 3];
+
+    // use linear congruence to make RGB noise
+    let mut seed = 0xcfcf_acab_u32;
+    let mut gen_sample = || {
+        let r = 4_294_967_291_u32;
+        let b = 67291_u32;
+        seed = seed.wrapping_mul(r).wrapping_add(b);
+        // grab a portion from the seed
+        (seed >> 7) as u8
+    };
+
+    let slab = 8;
+    for y in (0..rows as usize).step_by(slab) {
+        let scan_r = gen_sample();
+        let scan_g = gen_sample();
+        let scan_b = gen_sample();
+
+        for x in 0..columns as usize {
+            for k in 0..slab {
+                let offset = ((y + k) * columns as usize + x) * 3;
+                samples[offset] = scan_r;
+                samples[offset + 1] = scan_g;
+                samples[offset + 2] = scan_b;
+            }
+        }
+    }
+
+    // create test object of native encoding
+    let obj = TestDataObject {
+        // Explicit VR Little Endian
+        ts_uid: "1.2.840.10008.1.2.1".to_string(),
+        rows,
+        columns,
+        bits_allocated: 8,
+        bits_stored: 8,
+        samples_per_pixel: 3,
+        photometric_interpretation: "RGB",
+        number_of_frames: 1,
+        flat_pixel_data: Some(samples.clone()),
+        pixel_data_sequence: None,
+    };
+
+    // fetch adapters for JPEG XL lossless
+
+    let Codec::EncapsulatedPixelData(_, Some(writer)) =
+        dicom_transfer_syntax_registry::entries::JPEG_XL_LOSSLESS.codec()
+    else {
+        panic!("JPEG XL pixel data adapters not found")
+    };
+
+    let mut encoded = vec![];
+
+    let _ops = writer
+        .encode_frame(&obj, 0, EncodeOptions::default(), &mut encoded)
+        .expect("JPEG XL frame encoding failed");
+
+    let len_1 = encoded.len();
+    assert!(len_1 > 50);
+    let encoded_copy = encoded.clone();
+
+    // do it again
+
+    let _ops = writer
+        .encode_frame(&obj, 0, EncodeOptions::default(), &mut encoded)
+        .expect("JPEG XL frame encoding failed");
+
+    // expect _more_ data
+    assert!(encoded.len() > len_1 + 10);
+
+    // compare the first part of encoded data
+    assert_eq!(encoded[..len_1], encoded_copy, "encoded data mismatch");
 }

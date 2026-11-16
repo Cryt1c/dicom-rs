@@ -23,6 +23,8 @@ pub use self::primitive::{
     ValueType,
 };
 
+pub use either::Either;
+
 /// An aggregation of one or more elements in a value.
 pub type C<T> = SmallVec<[T; 2]>;
 
@@ -43,13 +45,46 @@ pub trait DicomValueType: HasLength {
     fn cardinality(&self) -> usize;
 }
 
+impl<L, R> HasLength for Either<L, R>
+where
+    L: HasLength,
+    R: HasLength,
+{
+    fn length(&self) -> Length {
+        match self {
+            Either::Left(l) => l.length(),
+            Either::Right(r) => r.length(),
+        }
+    }
+}
+
+impl<L, R> DicomValueType for Either<L, R>
+where
+    L: DicomValueType,
+    R: DicomValueType,
+{
+    fn value_type(&self) -> ValueType {
+        match self {
+            Either::Left(l) => l.value_type(),
+            Either::Right(r) => r.value_type(),
+        }
+    }
+
+    fn cardinality(&self) -> usize {
+        match self {
+            Either::Left(l) => l.cardinality(),
+            Either::Right(r) => r.cardinality(),
+        }
+    }
+}
+
 /// Representation of a full DICOM value, which may be either primitive or
 /// another DICOM object.
 ///
 /// `I` is the complex type for nest data set items, which should usually
 /// implement [`HasLength`].
 /// `P` is the encapsulated pixel data provider,
-/// which should usually implement `AsRef<[u8]>`.
+/// which should usually implement [`AsRef<[u8]>`].
 #[derive(Debug, Clone, PartialEq)]
 pub enum Value<I = EmptyObject, P = InMemFragment> {
     /// Primitive value.
@@ -70,7 +105,7 @@ impl<P> Value<EmptyObject, P> {
     /// As a consequence, it cannot be directly combined with
     /// DICOM objects that may contain sequence values.
     /// To let the type parameter `I` be inferred from its context,
-    /// create a [`PixelFragmentSequence`] and use `Value::from` instead.
+    /// create a [`PixelFragmentSequence`] and use [`Value::from`] instead.
     ///
     /// **Note:** This function does not validate the offset table
     /// against the fragments.
@@ -87,11 +122,11 @@ impl<I> Value<I> {
     /// from a list of items and length.
     ///
     /// This function will define the pixel data fragment type parameter `P`
-    /// to the `Value` type's default ([`InMemFragment`]),
+    /// to the [`Value`] type's default ([`InMemFragment`]),
     /// so that it can be used more easily.
     /// If necessary,
     /// it is possible to let this type parameter be inferred from its context
-    /// by creating a [`DataSetSequence`] and using `Value::from` instead.
+    /// by creating a [`DataSetSequence`] and using [`Value::from`] instead.
     #[inline]
     pub fn new_sequence<T>(items: T, length: Length) -> Self
     where
@@ -104,7 +139,7 @@ impl<I> Value<I> {
 impl Value {
     /// Construct a DICOM value from a primitive value.
     ///
-    /// This is equivalent to `Value::from` in behavior,
+    /// This is equivalent to [`Value::from`] in behavior,
     /// except that suitable type parameters are specified
     /// instead of inferred.
     ///
@@ -118,7 +153,7 @@ impl Value {
     /// DICOM objects that may contain
     /// nested data sets or encapsulated pixel data.
     /// To let the type parameters `I` and `P` be inferred from their context,
-    /// create a value of one of the types and use `Value::from` instead.
+    /// create a value of one of the types and use [`Value::from`] instead.
     ///
     /// - [`PrimitiveValue`]
     /// - [`PixelFragmentSequence`]
@@ -151,6 +186,27 @@ impl<I, P> Value<I, P> {
         }
     }
 
+    /// Produce a shallow clone of the value,
+    /// leaving the items and pixel data fragments as references.
+    ///
+    /// If the value is primitive,
+    /// the entire value will be copied.
+    /// Otherwise, the item or fragment sequences
+    /// will hold references to the original data.
+    pub fn shallow_clone(&self) -> Value<&I, &P> {
+        match self {
+            Value::Primitive(v) => Value::Primitive(v.clone()),
+            Value::Sequence(v) => Value::Sequence(DataSetSequence {
+                items: v.items.iter().collect(),
+                length: v.length,
+            }),
+            Value::PixelSequence(v) => Value::PixelSequence(PixelFragmentSequence {
+                offset_table: v.offset_table.iter().copied().collect(),
+                fragments: v.fragments.iter().collect(),
+            }),
+        }
+    }
+
     /// Gets a mutable reference to the primitive value.
     pub fn primitive_mut(&mut self) -> Option<&mut PrimitiveValue> {
         match self {
@@ -161,7 +217,7 @@ impl<I, P> Value<I, P> {
 
     /// Gets a reference to the items of a sequence.
     ///
-    /// Returns `None` if the value is not a data set sequence.
+    /// Returns [`None`] if the value is not a data set sequence.
     pub fn items(&self) -> Option<&[I]> {
         match self {
             Value::Sequence(v) => Some(v.items()),
@@ -171,7 +227,7 @@ impl<I, P> Value<I, P> {
 
     /// Gets a mutable reference to the items of a sequence.
     ///
-    /// Returns `None` if the value is not a data set sequence.
+    /// Returns [`None`] if the value is not a data set sequence.
     pub fn items_mut(&mut self) -> Option<&mut C<I>> {
         match self {
             Value::Sequence(v) => Some(v.items_mut()),
@@ -181,7 +237,7 @@ impl<I, P> Value<I, P> {
 
     /// Gets a reference to the fragments of a pixel data sequence.
     ///
-    /// Returns `None` if the value is not a pixel data sequence.
+    /// Returns [`None`] if the value is not a pixel data sequence.
     pub fn fragments(&self) -> Option<&[P]> {
         match self {
             Value::PixelSequence(v) => Some(v.fragments()),
@@ -191,7 +247,7 @@ impl<I, P> Value<I, P> {
 
     /// Gets a mutable reference to the fragments of a pixel data sequence.
     ///
-    /// Returns `None` if the value is not a pixel data sequence.
+    /// Returns [`None`] if the value is not a pixel data sequence.
     pub fn fragments_mut(&mut self) -> Option<&mut C<P>> {
         match self {
             Value::PixelSequence(v) => Some(v.fragments_mut()),
@@ -210,7 +266,7 @@ impl<I, P> Value<I, P> {
     /// Retrieves the data set items,
     /// discarding the recorded length information.
     ///
-    /// Returns `None` if the value is not a data set sequence.
+    /// Returns [`None`] if the value is not a data set sequence.
     pub fn into_items(self) -> Option<C<I>> {
         match self {
             Value::Sequence(v) => Some(v.into_items()),
@@ -229,7 +285,7 @@ impl<I, P> Value<I, P> {
 
     /// Gets a reference to the encapsulated pixel data's offset table.
     ///
-    /// Returns `None` if the value is not a pixel data sequence.
+    /// Returns [`None`] if the value is not a pixel data sequence.
     pub fn offset_table(&self) -> Option<&[u32]> {
         match self {
             Value::PixelSequence(v) => Some(v.offset_table()),
@@ -239,7 +295,7 @@ impl<I, P> Value<I, P> {
 
     /// Gets a mutable reference to the encapsulated pixel data's offset table.
     ///
-    /// Returns `None` if the value is not a pixel data sequence.
+    /// Returns [`None`] if the value is not a pixel data sequence.
     pub fn offset_table_mut(&mut self) -> Option<&mut C<u32>> {
         match self {
             Value::PixelSequence(v) => Some(v.offset_table_mut()),
@@ -314,6 +370,12 @@ impl<I, P> HasLength for Value<I, P> {
     }
 }
 
+impl<I, P> HasLength for &Value<I, P> {
+    fn length(&self) -> Length {
+        HasLength::length(*self)
+    }
+}
+
 impl<I, P> DicomValueType for Value<I, P> {
     fn value_type(&self) -> ValueType {
         match self {
@@ -329,6 +391,16 @@ impl<I, P> DicomValueType for Value<I, P> {
             Value::Sequence(DataSetSequence { items, .. }) => items.len(),
             Value::PixelSequence { .. } => 1,
         }
+    }
+}
+
+impl<I, P> DicomValueType for &Value<I, P> {
+    fn value_type(&self) -> ValueType {
+        DicomValueType::value_type(*self)
+    }
+
+    fn cardinality(&self) -> usize {
+        DicomValueType::cardinality(*self)
     }
 }
 
@@ -382,8 +454,6 @@ where
     /// a vector of strings as described in [`PrimitiveValue::to_multi_str`].
     ///
     /// Returns an error if the value is not primitive.
-    ///
-    /// [`PrimitiveValue::to_multi_str`]: ../enum.PrimitiveValue.html#to_multi_str
     pub fn to_multi_str(&self) -> Result<Cow<'_, [String]>, CastValueError> {
         match self {
             Value::Primitive(prim) => Ok(prim.to_multi_str()),
@@ -396,8 +466,8 @@ where
 
     /// Convert the full primitive value into raw bytes.
     ///
-    /// String values already encoded with the `Str` and `Strs` variants
-    /// are provided in UTF-8.
+    /// String values already encoded with the [`PrimitiveValue::Str`] and
+    /// [`PrimitiveValue::Strs`] variants are provided in UTF-8.
     ///
     /// Returns an error if the value is not primitive.
     pub fn to_bytes(&self) -> Result<Cow<'_, [u8]>, ConvertValueError> {
@@ -415,8 +485,6 @@ where
     ///
     /// If the value is a primitive, it will be converted into
     /// an integer as described in [`PrimitiveValue::to_int`].
-    ///
-    /// [`PrimitiveValue::to_int`]: ../enum.PrimitiveValue.html#to_int
     pub fn to_int<T>(&self) -> Result<T, ConvertValueError>
     where
         T: Clone,
@@ -436,9 +504,7 @@ where
     /// Retrieve and convert the primitive value into a sequence of integers.
     ///
     /// If the value is a primitive, it will be converted into
-    /// a vector of integers as described in [PrimitiveValue::to_multi_int].
-    ///
-    /// [PrimitiveValue::to_multi_int]: ../enum.PrimitiveValue.html#to_multi_int
+    /// a vector of integers as described in [`PrimitiveValue::to_multi_int`].
     pub fn to_multi_int<T>(&self) -> Result<Vec<T>, ConvertValueError>
     where
         T: Clone,
@@ -460,8 +526,6 @@ where
     ///
     /// If the value is a primitive, it will be converted into
     /// a number as described in [`PrimitiveValue::to_float32`].
-    ///
-    /// [`PrimitiveValue::to_float32`]: ../enum.PrimitiveValue.html#to_float32
     pub fn to_float32(&self) -> Result<f32, ConvertValueError> {
         match self {
             Value::Primitive(v) => v.to_float32(),
@@ -474,12 +538,27 @@ where
     }
 
     /// Retrieve and convert the primitive value
+    /// into a finite single-precision floating point number.
+    ///
+    /// If the value is a primitive, it will be converted into
+    /// a number as described in [`PrimitiveValue::to_finite_float32`].
+    pub fn to_finite_float32(&self) -> Result<f32, ConvertValueError> {
+        match self {
+            Value::Primitive(v) => v.to_finite_float32(),
+            _ => Err(ConvertValueError {
+                requested: "finite float32",
+                original: self.value_type(),
+                cause: None,
+            }),
+        }
+    }
+
+    /// Retrieve and convert the primitive value
     /// into a sequence of single-precision floating point numbers.
     ///
     /// If the value is a primitive, it will be converted into
-    /// a vector of numbers as described in [`PrimitiveValue::to_multi_float32`].
-    ///
-    /// [`PrimitiveValue::to_multi_float32`]: ../enum.PrimitiveValue.html#to_multi_float32
+    /// a vector of numbers as described in
+    /// [`PrimitiveValue::to_multi_float32`].
     pub fn to_multi_float32(&self) -> Result<Vec<f32>, ConvertValueError> {
         match self {
             Value::Primitive(v) => v.to_multi_float32(),
@@ -492,12 +571,27 @@ where
     }
 
     /// Retrieve and convert the primitive value
+    /// into a sequence of finite single-precision floating point numbers.
+    ///
+    /// If the value is a primitive, it will be converted into
+    /// a vector of numbers as described in
+    /// [`PrimitiveValue::to_multi_finite_float32`].
+    pub fn to_multi_finite_float32(&self) -> Result<Vec<f32>, ConvertValueError> {
+        match self {
+            Value::Primitive(v) => v.to_multi_finite_float32(),
+            _ => Err(ConvertValueError {
+                requested: "finite float32",
+                original: self.value_type(),
+                cause: None,
+            }),
+        }
+    }
+
+    /// Retrieve and convert the primitive value
     /// into a double-precision floating point number.
     ///
     /// If the value is a primitive, it will be converted into
     /// a number as described in [`PrimitiveValue::to_float64`].
-    ///
-    /// [`PrimitiveValue::to_float64`]: ../enum.PrimitiveValue.html#to_float64
     pub fn to_float64(&self) -> Result<f64, ConvertValueError> {
         match self {
             Value::Primitive(v) => v.to_float64(),
@@ -510,12 +604,27 @@ where
     }
 
     /// Retrieve and convert the primitive value
+    /// into a finite double-precision floating point number.
+    ///
+    /// If the value is a primitive, it will be converted into
+    /// a number as described in [`PrimitiveValue::to_finite_float64`].
+    pub fn to_finite_float64(&self) -> Result<f64, ConvertValueError> {
+        match self {
+            Value::Primitive(v) => v.to_finite_float64(),
+            _ => Err(ConvertValueError {
+                requested: "finite float64",
+                original: self.value_type(),
+                cause: None,
+            }),
+        }
+    }
+
+    /// Retrieve and convert the primitive value
     /// into a sequence of double-precision floating point numbers.
     ///
     /// If the value is a primitive, it will be converted into
-    /// a vector of numbers as described in [`PrimitiveValue::to_multi_float64`].
-    ///
-    /// [`PrimitiveValue::to_multi_float64`]: ../enum.PrimitiveValue.html#to_multi_float64
+    /// a vector of numbers as described in
+    /// [`PrimitiveValue::to_multi_float64`].
     pub fn to_multi_float64(&self) -> Result<Vec<f64>, ConvertValueError> {
         match self {
             Value::Primitive(v) => v.to_multi_float64(),
@@ -527,11 +636,27 @@ where
         }
     }
 
-    /// Retrieve and convert the primitive value into a `DicomDate`.
+    /// Retrieve and convert the primitive value
+    /// into a sequence of finite double-precision floating point numbers.
     ///
     /// If the value is a primitive, it will be converted into
-    /// a `DicomDate` as described in [`PrimitiveValue::to_date`].
+    /// a vector of numbers as described in
+    /// [`PrimitiveValue::to_multi_finite_float64`].
+    pub fn to_multi_finite_float64(&self) -> Result<Vec<f64>, ConvertValueError> {
+        match self {
+            Value::Primitive(v) => v.to_multi_finite_float64(),
+            _ => Err(ConvertValueError {
+                requested: "finite float64",
+                original: self.value_type(),
+                cause: None,
+            }),
+        }
+    }
+
+    /// Retrieve and convert the primitive value into a [`DicomDate`].
     ///
+    /// If the value is a primitive, it will be converted into
+    /// a [`DicomDate`] as described in [`PrimitiveValue::to_date`].
     pub fn to_date(&self) -> Result<DicomDate, ConvertValueError> {
         match self {
             Value::Primitive(v) => v.to_date(),
@@ -543,11 +668,12 @@ where
         }
     }
 
-    /// Retrieve and convert the primitive value into a sequence of `DicomDate`s.
+    /// Retrieve and convert the primitive value into a sequence of
+    /// [`DicomDate`]s.
     ///
     /// If the value is a primitive, it will be converted into
-    /// a vector of `DicomDate` as described in [`PrimitiveValue::to_multi_date`].
-    ///
+    /// a vector of [`DicomDate`] as described in
+    /// [`PrimitiveValue::to_multi_date`].
     pub fn to_multi_date(&self) -> Result<Vec<DicomDate>, ConvertValueError> {
         match self {
             Value::Primitive(v) => v.to_multi_date(),
@@ -559,11 +685,10 @@ where
         }
     }
 
-    /// Retrieve and convert the primitive value into a `DicomTime`.
+    /// Retrieve and convert the primitive value into a [`DicomTime`].
     ///
     /// If the value is a primitive, it will be converted into
-    /// a `DicomTime` as described in [`PrimitiveValue::to_time`].
-    ///
+    /// a [`DicomTime`] as described in [`PrimitiveValue::to_time`].
     pub fn to_time(&self) -> Result<DicomTime, ConvertValueError> {
         match self {
             Value::Primitive(v) => v.to_time(),
@@ -575,11 +700,12 @@ where
         }
     }
 
-    /// Retrieve and convert the primitive value into a sequence of `DicomTime`s.
+    /// Retrieve and convert the primitive value into a sequence of
+    /// [`DicomTime`]s.
     ///
     /// If the value is a primitive, it will be converted into
-    /// a vector of `DicomTime` as described in [`PrimitiveValue::to_multi_time`].
-    ///
+    /// a vector of [`DicomTime`] as described in
+    /// [`PrimitiveValue::to_multi_time`].
     pub fn to_multi_time(&self) -> Result<Vec<DicomTime>, ConvertValueError> {
         match self {
             Value::Primitive(v) => v.to_multi_time(),
@@ -591,11 +717,11 @@ where
         }
     }
 
-    /// Retrieve and convert the primitive value into a `DicomDateTime`.
+    /// Retrieve and convert the primitive value into a [`DicomDateTime`].
     ///
     /// If the value is a primitive, it will be converted into
-    /// a `DateTime` as described in [`PrimitiveValue::to_datetime`].
-    ///
+    /// a [`PrimitiveValue::DateTime`] as described in
+    /// [`PrimitiveValue::to_datetime`].
     pub fn to_datetime(&self) -> Result<DicomDateTime, ConvertValueError> {
         match self {
             Value::Primitive(v) => v.to_datetime(),
@@ -607,11 +733,12 @@ where
         }
     }
 
-    /// Retrieve and convert the primitive value into a sequence of `DicomDateTime`s.
+    /// Retrieve and convert the primitive value into a sequence of
+    /// [`DicomDateTime`]s.
     ///
     /// If the value is a primitive, it will be converted into
-    /// a vector of `DicomDateTime` as described in [`PrimitiveValue::to_multi_datetime`].
-    ///
+    /// a vector of [`DicomDateTime`] as described in
+    /// [`PrimitiveValue::to_multi_datetime`].
     pub fn to_multi_datetime(&self) -> Result<Vec<DicomDateTime>, ConvertValueError> {
         match self {
             Value::Primitive(v) => v.to_multi_datetime(),
@@ -623,11 +750,10 @@ where
         }
     }
 
-    /// Retrieve and convert the primitive value into a `DateRange`.
+    /// Retrieve and convert the primitive value into a [`DateRange`].
     ///
     /// If the value is a primitive, it will be converted into
-    /// a `DateRange` as described in [`PrimitiveValue::to_date_range`].
-    ///
+    /// a [`DateRange`] as described in [`PrimitiveValue::to_date_range`].
     pub fn to_date_range(&self) -> Result<DateRange, ConvertValueError> {
         match self {
             Value::Primitive(v) => v.to_date_range(),
@@ -639,11 +765,10 @@ where
         }
     }
 
-    /// Retrieve and convert the primitive value into a `TimeRange`.
+    /// Retrieve and convert the primitive value into a [`TimeRange`].
     ///
     /// If the value is a primitive, it will be converted into
-    /// a `TimeRange` as described in [`PrimitiveValue::to_time_range`].
-    ///
+    /// a [`TimeRange`] as described in [`PrimitiveValue::to_time_range`].
     pub fn to_time_range(&self) -> Result<TimeRange, ConvertValueError> {
         match self {
             Value::Primitive(v) => v.to_time_range(),
@@ -655,11 +780,11 @@ where
         }
     }
 
-    /// Retrieve and convert the primitive value into a `DateTimeRange`.
+    /// Retrieve and convert the primitive value into a [`DateTimeRange`].
     ///
     /// If the value is a primitive, it will be converted into
-    /// a `DateTimeRange` as described in [`PrimitiveValue::to_datetime_range`].
-    ///
+    /// a [`DateTimeRange`] as described in
+    /// [`PrimitiveValue::to_datetime_range`].
     pub fn to_datetime_range(&self) -> Result<DateTimeRange, ConvertValueError> {
         match self {
             Value::Primitive(v) => v.to_datetime_range(),
@@ -696,9 +821,9 @@ where
 }
 
 /// Macro for implementing getters to single and multi-values,
-/// by delegating to `PrimitiveValue`.
+/// by delegating to [`PrimitiveValue`].
 ///
-/// Should be placed inside `Value`'s impl block.
+/// Should be placed inside [`Value`]'s impl block.
 macro_rules! impl_primitive_getters {
     ($name_single: ident, $name_multi: ident, $variant: ident, $ret: ty) => {
         /// Get a single value of the requested type.
@@ -740,9 +865,9 @@ impl<I, P> Value<I, P> {
     /// An error is returned if the variant is not compatible.
     ///
     /// To enable conversions of other variants to a textual representation,
-    /// see [`to_str()`] instead.
+    /// see [`DataElement::to_str`] instead.
     ///
-    /// [`to_str()`]: #method.to_str
+    /// [`DataElement::to_str`]: crate::header::DataElement::to_str
     pub fn string(&self) -> Result<&str, CastValueError> {
         match self {
             Value::Primitive(v) => v.string(),
@@ -754,14 +879,15 @@ impl<I, P> Value<I, P> {
     }
 
     /// Get the inner sequence of string values
-    /// if the variant is either `Str` or `Strs`.
+    /// if the variant is either [`PrimitiveValue::Str`] or
+    /// [`PrimitiveValue::Strs`].
     ///
     /// An error is returned if the variant is not compatible.
     ///
     /// To enable conversions of other variants to a textual representation,
-    /// see [`to_str()`] instead.
+    /// see [`DataElement::to_str`] instead.
     ///
-    /// [`to_str()`]: #method.to_str
+    /// [`DataElement::to_str`]: crate::header::DataElement::to_str
     pub fn strings(&self) -> Result<&[String], CastValueError> {
         match self {
             Value::Primitive(v) => v.strings(),
@@ -800,7 +926,7 @@ pub struct DataSetSequence<I> {
     items: C<I>,
     /// The sequence length in bytes.
     ///
-    /// The value may be [`UNDEFINED`](Length::UNDEFINED)
+    /// The value may be [`Length::UNDEFINED`]
     /// if the length is implicitly defined,
     /// otherwise it should match the full byte length of all items.
     length: Length,
@@ -813,7 +939,7 @@ impl<I> DataSetSequence<I> {
     /// **Note:** This function does not validate the `length`
     /// against the items.
     /// When not sure,
-    /// `length` can be set to [`UNDEFINED`](Length::UNDEFINED)
+    /// `length` can be set to [`Length::UNDEFINED`]
     /// to leave it as implicitly defined.
     #[inline]
     pub fn new(items: impl Into<C<I>>, length: Length) -> Self {
@@ -912,7 +1038,7 @@ where
     A: smallvec::Array<Item = I>,
     C<I>: From<SmallVec<A>>,
 {
-    /// Converts a smallvec of items
+    /// Converts a [`smallvec`] of items
     /// into a data set sequence with an undefined length.
     #[inline]
     fn from(items: SmallVec<A>) -> Self {
@@ -1247,10 +1373,9 @@ mod tests {
         ));
 
         assert_eq!(
-            Value::new(PrimitiveValue::Date(smallvec![DicomDate::from_ymd(
-                2014, 10, 12
-            )
-            .unwrap()]))
+            Value::new(PrimitiveValue::Date(smallvec![
+                DicomDate::from_ymd(2014, 10, 12).unwrap()
+            ]))
             .date()
             .ok(),
             Some(DicomDate::from_ymd(2014, 10, 12).unwrap()),
@@ -1266,10 +1391,9 @@ mod tests {
         );
 
         assert!(matches!(
-            Value::new(PrimitiveValue::Date(smallvec![DicomDate::from_ymd(
-                2014, 10, 12
-            )
-            .unwrap()]))
+            Value::new(PrimitiveValue::Date(smallvec![
+                DicomDate::from_ymd(2014, 10, 12).unwrap()
+            ]))
             .time(),
             Err(CastValueError {
                 requested: "time",

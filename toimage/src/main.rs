@@ -1,14 +1,17 @@
 //! A CLI tool for converting a DICOM image file
 //! into a general purpose image file (e.g. PNG).
-use std::{borrow::Cow, path::PathBuf, str::FromStr};
+use std::{path::PathBuf, str::FromStr};
 
-use clap::Parser;
-use dicom_core::prelude::*;
-use dicom_dictionary_std::{tags, uids};
-use dicom_object::{open_file, FileDicomObject, InMemDicomObject};
-use dicom_pixeldata::{ConvertOptions, PixelDecoder};
+use clap::{ArgAction, Parser};
+use dicom_dictionary_std::uids;
+use dicom_encoding::adapters::PixelDataObject;
+use dicom_object::{FileDicomObject, InMemDicomObject, open_file};
+use dicom_pixeldata::{
+    ConvertOptions, OverlayPlane, PixelDecoder,
+    image::{DynamicImage, ImageBuffer, Pixel, Rgb},
+};
 use snafu::{OptionExt, Report, ResultExt, Snafu, Whatever};
-use tracing::{error, warn, Level};
+use tracing::{Level, error, warn};
 
 /// Convert DICOM files into image files
 #[derive(Debug, Parser)]
@@ -54,7 +57,7 @@ struct App {
 }
 
 /// Options related to image output and conversion steps
-#[derive(Debug, Copy, Clone, Parser)]
+#[derive(Debug, Clone, Parser)]
 struct ImageOptions {
     /// Force output bit depth to 8 bits per sample
     #[arg(long = "8bit", conflicts_with = "force_16bit")]
@@ -64,16 +67,61 @@ struct ImageOptions {
     #[arg(long = "16bit", conflicts_with = "force_8bit")]
     force_16bit: bool,
 
+    /// Skip the modality LUT transformation (implies --no-voi-lut)
+    #[arg(long = "no-modality-lut", action = ArgAction::SetFalse)]
+    modality_lut: bool,
+
+    /// Skip the VOI LUT transformation
+    #[arg(long = "no-voi-lut", action = ArgAction::SetFalse)]
+    voi_lut: bool,
+
     /// Output the raw pixel data instead of decoding it
     #[arg(
         long = "unwrap",
         conflicts_with = "force_8bit",
-        conflicts_with = "force_16bit"
+        conflicts_with = "force_16bit",
+        conflicts_with = "modality_lut",
+        conflicts_with = "voi_lut"
     )]
     unwrap: bool,
     /// Decode all pixel data frames instead of just the one intended
     #[arg(hide(true), long)]
     decode_all: bool,
+
+    /// Render the overlay planes (groups 6000-601E) on top of the image
+    /// (the output becomes RGB when an overlay applies to the frame)
+    #[arg(long = "overlays", conflicts_with = "unwrap")]
+    overlays: bool,
+
+    /// Color for overlay rendering as an RGB hex code (e.g. "ff0000" or "#00ff00").
+    /// May be given multiple times to color each overlay plane differently,
+    /// assigned in ascending overlay group order and cycled if there are
+    /// more planes than colors
+    #[arg(
+        long = "overlay-color",
+        default_value = "ffffff",
+        value_parser = parse_color,
+        requires = "overlays"
+    )]
+    overlay_color: Vec<[u8; 3]>,
+
+    /// Path to an additional DICOM file to take overlay planes from
+    /// (e.g. a presentation state object referencing the image).
+    /// May be given multiple times;
+    /// planes are appended after those of the image itself
+    #[arg(long = "overlay-file", requires = "overlays")]
+    overlay_file: Vec<PathBuf>,
+}
+
+fn parse_color(s: &str) -> Result<[u8; 3], String> {
+    let s = s.trim_start_matches('#');
+    if s.len() != 6 || !s.chars().all(|c| c.is_ascii_hexdigit()) {
+        return Err(format!(
+            "invalid RGB hex color `{s}` (expected 6 hexadecimal digits)"
+        ));
+    }
+    let v = u32::from_str_radix(s, 16).map_err(|e| e.to_string())?;
+    Ok([(v >> 16) as u8, (v >> 8) as u8, v as u8])
 }
 
 #[derive(Debug, Snafu)]
@@ -93,12 +141,6 @@ enum Error {
     MissingOffsetEntry { frame_number: u32 },
     /// missing key property {name}
     MissingProperty { name: &'static str },
-    /// property {name} contains an invalid value
-    InvalidPropertyValue {
-        name: &'static str,
-        #[snafu(source(from(dicom_core::value::ConvertValueError, Box::new)))]
-        source: Box<dicom_core::value::ConvertValueError>,
-    },
     /// pixel data of frame #{frame_number} is out of bounds
     FrameOutOfBounds { frame_number: u32 },
     /// failed to convert pixel data to image
@@ -128,7 +170,6 @@ impl Error {
             Error::DecodePixelData { .. }
             | Error::MissingOffsetEntry { .. }
             | Error::MissingProperty { .. }
-            | Error::InvalidPropertyValue { .. }
             | Error::FrameOutOfBounds { .. } => -2,
             Error::ConvertImage { .. } => -3,
             Error::SaveData { .. } | Error::SaveImage { .. } => -4,
@@ -200,8 +241,15 @@ fn run(args: App) -> Result<(), Error> {
                     image_options.unwrap,
                 );
 
-                convert_single_file(&file.0, false, output, frame_number, image_options, verbose)
-                    .or_else(|e| {
+                convert_single_file(
+                    &file.0,
+                    false,
+                    output,
+                    frame_number,
+                    image_options.clone(),
+                    verbose,
+                )
+                .or_else(|e| {
                     if fail_first {
                         Err(e)
                     } else {
@@ -229,7 +277,7 @@ fn run(args: App) -> Result<(), Error> {
                 output_is_set,
                 output,
                 frame_number,
-                image_options,
+                image_options.clone(),
                 verbose,
             )?;
         }
@@ -262,7 +310,7 @@ fn run(args: App) -> Result<(), Error> {
                 false,
                 output,
                 frame_number,
-                image_options,
+                image_options.clone(),
                 verbose,
             )
             .or_else(|e| {
@@ -321,8 +369,13 @@ fn convert_single_file(
     let ImageOptions {
         force_8bit,
         force_16bit,
+        modality_lut,
+        voi_lut,
         unwrap,
         decode_all,
+        overlays,
+        overlay_color,
+        overlay_file,
     } = image_options;
 
     if unwrap {
@@ -340,13 +393,10 @@ fn convert_single_file(
                 | uids::JPEG2000_LOSSLESS => {
                     output.set_extension("jp2");
                 }
-                uids::JPEGLS_LOSSLESS
-                | uids::JPEGLS_NEAR_LOSSLESS => {
+                uids::JPEGLS_LOSSLESS | uids::JPEGLS_NEAR_LOSSLESS => {
                     output.set_extension("jls");
                 }
-                uids::JPEGXL
-                | uids::JPEGXLJPEG_RECOMPRESSION
-                | uids::JPEGXL_LOSSLESS => {
+                uids::JPEGXL | uids::JPEGXLJPEG_RECOMPRESSION | uids::JPEGXL_LOSSLESS => {
                     output.set_extension("jxl");
                 }
                 _ => {
@@ -355,109 +405,9 @@ fn convert_single_file(
             }
         }
 
-        let pixeldata = file.get(tags::PIXEL_DATA).with_context(|| {
-            error!("{}: DICOM file has no pixel data", output.display());
-            MissingPropertySnafu { name: "PixelData" }
-        })?;
-
-        let out_data = match pixeldata.value() {
-            DicomValue::PixelSequence(seq) => {
-                let number_of_frames = match file.get(tags::NUMBER_OF_FRAMES) {
-                    Some(elem) => elem.to_int::<u32>().unwrap_or_else(|e| {
-                        tracing::warn!("Invalid Number of Frames: {}", e);
-                        1
-                    }),
-                    None => 1,
-                };
-
-                if number_of_frames as usize == seq.fragments().len() {
-                    // frame-to-fragment mapping is 1:1
-
-                    // get fragment containing our frame
-                    let fragment =
-                        seq.fragments()
-                            .get(frame_number as usize)
-                            .with_context(|| {
-                                error!(
-                                    "{}: Frame number {} is out of range",
-                                    output.display(),
-                                    frame_number
-                                );
-                                FrameOutOfBoundsSnafu { frame_number }
-                            })?;
-
-                    Cow::Borrowed(&fragment[..])
-                } else {
-                    // In this case we look up the basic offset table
-                    // and gather all of the frame's fragments in a single vector.
-                    // Note: not the most efficient way to do this,
-                    // consider optimizing later with byte chunk readers
-                    let offset_table = seq.offset_table();
-                    let base_offset = offset_table.get(frame_number as usize).copied();
-                    let base_offset = if frame_number == 0 {
-                        base_offset.unwrap_or(0) as usize
-                    } else {
-                        base_offset.context(MissingOffsetEntrySnafu { frame_number })? as usize
-                    };
-                    let next_offset = offset_table.get(frame_number as usize + 1);
-
-                    let mut offset = 0;
-                    let mut frame_data = Vec::new();
-                    for fragment in seq.fragments() {
-                        // include it
-                        if offset >= base_offset {
-                            frame_data.extend_from_slice(fragment);
-                        }
-                        offset += fragment.len() + 8;
-                        if let Some(&next_offset) = next_offset {
-                            if offset >= next_offset as usize {
-                                // next fragment is for the next frame
-                                break;
-                            }
-                        }
-                    }
-
-                    Cow::Owned(frame_data)
-                }
-            }
-            DicomValue::Primitive(v) => {
-                // grab the intended slice based on image properties
-
-                let get_int_property = |tag, name| {
-                    file.get(tag)
-                        .context(MissingPropertySnafu { name })?
-                        .to_int::<usize>()
-                        .context(InvalidPropertyValueSnafu { name })
-                };
-
-                let rows = get_int_property(tags::ROWS, "Rows")?;
-                let columns = get_int_property(tags::COLUMNS, "Columns")?;
-                let samples_per_pixel =
-                    get_int_property(tags::SAMPLES_PER_PIXEL, "Samples Per Pixel")?;
-                let bits_allocated = get_int_property(tags::BITS_ALLOCATED, "Bits Allocated")?;
-                let frame_size = rows * columns * samples_per_pixel * ((bits_allocated + 7) / 8);
-
-                let frame = frame_number as usize;
-                let mut data = v.to_bytes();
-                match &mut data {
-                    Cow::Borrowed(data) => {
-                        *data = data
-                            .get((frame_size * frame)..(frame_size * (frame + 1)))
-                            .context(FrameOutOfBoundsSnafu { frame_number })?;
-                    }
-                    Cow::Owned(data) => {
-                        *data = data
-                            .get((frame_size * frame)..(frame_size * (frame + 1)))
-                            .context(FrameOutOfBoundsSnafu { frame_number })?
-                            .to_vec();
-                    }
-                }
-                data
-            }
-            _ => {
-                return UnexpectedPixelDataSnafu.fail();
-            }
-        };
+        let out_data = file
+            .frame_pixel_data(frame_number)
+            .with_context(|| FrameOutOfBoundsSnafu { frame_number })?;
         std::fs::create_dir_all(output.parent().unwrap()).unwrap();
         std::fs::write(output, out_data).context(SaveDataSnafu)?;
     } else {
@@ -486,11 +436,32 @@ fn convert_single_file(
             options = options.force_8bit();
         }
 
+        if !modality_lut {
+            options = options.with_modality_lut(dicom_pixeldata::ModalityLutOption::None);
+        }
+        if !modality_lut || !voi_lut {
+            options = options.with_voi_lut(dicom_pixeldata::VoiLutOption::Identity);
+        }
+
         // the effective frame number
         let frame_num = if decode_all { frame_number } else { 0 };
         let image = pixel
             .to_dynamic_image_with_options(frame_num, &options)
             .context(ConvertImageSnafu)?;
+
+        let image = if overlays {
+            let mut overlay_planes = file.decode_overlays().context(DecodePixelDataSnafu)?;
+            for path in &overlay_file {
+                let obj = open_file(path).with_context(|_| ReadFileSnafu { path: path.clone() })?;
+                overlay_planes.extend(obj.decode_overlays().context(DecodePixelDataSnafu)?);
+            }
+            if verbose {
+                println!("{} overlay plane(s) found", overlay_planes.len());
+            }
+            apply_overlays(image, &overlay_planes, frame_number, &overlay_color)
+        } else {
+            image
+        };
 
         std::fs::create_dir_all(output.parent().unwrap()).unwrap();
 
@@ -502,6 +473,77 @@ fn convert_single_file(
     }
 
     Ok(())
+}
+
+/// Paint the overlay planes which apply to the given image frame
+/// on top of the image.
+///
+/// Colors are assigned to the planes in the order given,
+/// cycling through the color list
+/// if there are more planes than colors.
+fn apply_overlays(
+    image: DynamicImage,
+    overlays: &[OverlayPlane],
+    image_frame: u32,
+    colors: &[[u8; 3]],
+) -> DynamicImage {
+    if colors.is_empty()
+        || !overlays
+            .iter()
+            .any(|plane| plane.frame_for_image_frame(image_frame).is_some())
+    {
+        return image;
+    }
+
+    match image {
+        DynamicImage::ImageLuma16(_)
+        | DynamicImage::ImageLumaA16(_)
+        | DynamicImage::ImageRgb16(_)
+        | DynamicImage::ImageRgba16(_) => {
+            let mut img = image.into_rgb16();
+            for (i, plane) in overlays.iter().enumerate() {
+                let color = Rgb(colors[i % colors.len()].map(|c| c as u16 * 257));
+                paint_overlay(&mut img, plane, image_frame, color);
+            }
+            DynamicImage::ImageRgb16(img)
+        }
+        _ => {
+            let mut img = image.into_rgb8();
+            for (i, plane) in overlays.iter().enumerate() {
+                paint_overlay(&mut img, plane, image_frame, Rgb(colors[i % colors.len()]));
+            }
+            DynamicImage::ImageRgb8(img)
+        }
+    }
+}
+
+fn paint_overlay<P: Pixel>(
+    img: &mut ImageBuffer<P, Vec<P::Subpixel>>,
+    plane: &OverlayPlane,
+    image_frame: u32,
+    color: P,
+) {
+    let Some(overlay_frame) = plane.frame_for_image_frame(image_frame) else {
+        return;
+    };
+    let (width, height) = (img.width() as i64, img.height() as i64);
+    // 1-based origin: an origin of [1, 1] aligns the overlay with the image
+    let [origin_row, origin_col] = plane.origin();
+    for orow in 0..plane.rows() as i64 {
+        let ir = orow + origin_row as i64 - 1;
+        if ir < 0 || ir >= height {
+            continue;
+        }
+        for ocol in 0..plane.columns() as i64 {
+            let ic = ocol + origin_col as i64 - 1;
+            if ic < 0 || ic >= width {
+                continue;
+            }
+            if plane.is_set(overlay_frame, orow as u32, ocol as u32) {
+                img.put_pixel(ic as u32, ir as u32, color);
+            }
+        }
+    }
 }
 
 fn collect_dicom_files(
@@ -549,5 +591,13 @@ mod tests {
     #[test]
     fn verify_cli() {
         App::command().debug_assert();
+    }
+
+    #[test]
+    fn verify_parse_color() {
+        assert_eq!(crate::parse_color("ff0000"), Ok([255, 0, 0]));
+        assert_eq!(crate::parse_color("#00FF7f"), Ok([0, 255, 127]));
+        assert!(crate::parse_color("ff00").is_err());
+        assert!(crate::parse_color("gggggg").is_err());
     }
 }

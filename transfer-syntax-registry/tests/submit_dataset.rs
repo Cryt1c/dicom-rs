@@ -5,8 +5,8 @@
 #![cfg(feature = "inventory-registry")]
 
 use dicom_encoding::{
-    submit_transfer_syntax, Codec, DataRWAdapter, Endianness, NeverPixelAdapter, TransferSyntax,
-    TransferSyntaxIndex,
+    Codec, DataRWAdapter, Endianness, NeverPixelAdapter, TransferSyntax, TransferSyntaxIndex,
+    submit_transfer_syntax,
 };
 use dicom_transfer_syntax_registry::TransferSyntaxRegistry;
 use std::io::{Read, Write};
@@ -16,7 +16,6 @@ use std::io::{Read, Write};
 struct DummyCodecAdapter;
 
 impl DataRWAdapter for DummyCodecAdapter {
-
     fn adapt_reader<'r>(&self, reader: Box<dyn Read + 'r>) -> Box<dyn Read + 'r> {
         reader
     }

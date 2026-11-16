@@ -1,7 +1,9 @@
-use dicom_dictionary_std::uids::VERIFICATION;
-use dicom_ul::ClientAssociationOptions;
+use dicom_dictionary_std::uids::{self, VERIFICATION};
+use dicom_ul::{ClientAssociationOptions, Pdu, ServerAssociationOptions};
 use rstest::rstest;
 use std::time::Instant;
+
+type Result<T, E = Box<dyn std::error::Error + Send + Sync + 'static>> = std::result::Result<T, E>;
 
 const TIMEOUT_TOLERANCE: u64 = 25;
 
@@ -52,4 +54,51 @@ async fn test_slow_association_async(#[case] timeout: u64) {
         elapsed.as_millis(),
         timeout
     );
+}
+
+/// Associations can be established
+/// when identifying remote nodes by their application entity address.
+#[test]
+fn test_establish_via_ae_address() -> Result<()> {
+    let listener = std::net::TcpListener::bind("localhost:0")?;
+    let addr = listener.local_addr()?;
+    let scp = ServerAssociationOptions::new()
+        .accept_called_ae_title()
+        .ae_title("THIS-SCP")
+        .with_abstract_syntax(VERIFICATION);
+
+    // Spawn server thread
+    let h = std::thread::spawn(move || -> Result<_> {
+        let (stream, _addr) = listener.accept()?;
+        let mut association = scp.establish(stream)?;
+
+        // handle one release request
+        let pdu = association.receive()?;
+        assert_eq!(pdu, Pdu::ReleaseRQ);
+        association.send(&Pdu::ReleaseRP)?;
+
+        Ok(association)
+    });
+
+    // use bound socket address to create AE address
+    let ae_address = format!("THIS-SCP@{addr}");
+
+    // create SCU and establish association
+    let association = ClientAssociationOptions::new()
+        .calling_ae_title("THIS-SCU")
+        .with_presentation_context(
+            uids::VERIFICATION,
+            vec![
+                uids::IMPLICIT_VR_LITTLE_ENDIAN,
+                uids::EXPLICIT_VR_LITTLE_ENDIAN,
+            ],
+        )
+        .establish_with(&ae_address)?;
+
+    // just release and finish
+    association.release()?;
+
+    let _ = h.join();
+
+    Ok(())
 }

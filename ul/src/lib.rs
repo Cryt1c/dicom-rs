@@ -17,13 +17,25 @@
 //!   between application entities,
 //!   via the upper layer protocol by TCP.
 //!
+//! DICOM Associations on top of TLS is also supported,
+//! thus offering a Secure Transport Connection.
+//! TLS capabilities are provided by one of the backends
+//! supported by [Rustls](::rustls),
+//! which includes client authentication if desired.
+//!
 //! ## Features
-//! * `async`: Enables a fully async implementation of the upper layer protocol.
+//!
+//! * `async`: Enables a fully asynchronous implementation of the upper layer protocol.
 //!   See [`ClientAssociationOptions`] and [`ServerAssociationOptions`] for details
+//! * `sync-tls` (or `tls`): Enables TLS support for synchronous associations.
+//! * `async-tls`: Enables TLS support for asynchronous associations.
+//!   Implies `async` and `sync-tls`.
+//! * `full`: Enables all capabilities: `async-tls`
 
 pub mod address;
 pub mod association;
 pub mod pdu;
+pub mod prelude;
 
 /// The current implementation class UID generically referring to DICOM-rs.
 ///
@@ -31,19 +43,19 @@ pub mod pdu;
 ///
 /// This UID may change in future versions,
 /// even between patch versions.
-pub const IMPLEMENTATION_CLASS_UID: &str = "2.25.262086406829110419931297894772577063974";
+pub const IMPLEMENTATION_CLASS_UID: &str = "2.25.268051044599311345688996422911472681751";
 
 /// The current implementation version name generically referring to DICOM-rs.
 ///
 /// This name may change in future versions,
 /// even between patch versions.
-pub const IMPLEMENTATION_VERSION_NAME: &str = "DICOM-rs 0.8.1";
+pub const IMPLEMENTATION_VERSION_NAME: &str = "DICOM-rs 0.10.1";
 
 // re-exports
 
 pub use address::{AeAddr, FullAeAddr};
 pub use association::client::{ClientAssociation, ClientAssociationOptions};
 pub use association::server::{ServerAssociation, ServerAssociationOptions};
+pub use pdu::Pdu;
 pub use pdu::read_pdu;
 pub use pdu::write_pdu;
-pub use pdu::Pdu;

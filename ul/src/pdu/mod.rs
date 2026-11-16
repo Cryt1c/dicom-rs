@@ -11,24 +11,38 @@ use std::fmt::Display;
 
 pub use reader::read_pdu;
 use snafu::{Backtrace, Snafu};
-pub use writer::{write_pdu, WriteChunkError};
-
-/// The default maximum PDU size
-pub const DEFAULT_MAX_PDU: u32 = 16_384;
-
-/// The minimum PDU size,
-/// as specified by the standard
-pub const MINIMUM_PDU_SIZE: u32 = 4_096;
-
-/// The maximum PDU size,
-/// as specified by the standard
-pub const MAXIMUM_PDU_SIZE: u32 = 131_072;
+pub use writer::{WriteChunkError, write_pdu};
 
 /// The length of the PDU header in bytes,
 /// comprising the PDU type (1 byte),
 /// reserved byte (1 byte),
 /// and PDU length (4 bytes).
 pub const PDU_HEADER_SIZE: u32 = 6;
+
+/// The length of a PDV header + message control header in bytes,
+/// comprising the PDV length (4 bytes),
+/// presentation context ID (1 byte),
+/// and the flags that precede the data (1 byte).
+pub const PDV_HEADER_SIZE: u32 = 6;
+
+/// The default maximum PDU size
+pub const DEFAULT_MAX_PDU: u32 = 32_768 - PDU_HEADER_SIZE;
+
+/// The smallest maximum PDU length negotiable
+/// by this implementation
+pub const MINIMUM_PDU_SIZE: u32 = 1_024 - PDU_HEADER_SIZE;
+
+/// The largest PDU size supported. It must be an even number.
+/// Together with the PDU header, it must not exceed u32::MAX,
+/// and when adding the PDU header size, it must not overflow.
+// `clippy` complains that !1 already equals u32::MAX & !1, but this
+// formulation expresses intent, so disable the warning
+#[allow(clippy::identity_op)]
+pub const MAXIMUM_PDU_SIZE: u32 = (u32::MAX & !1) - PDU_HEADER_SIZE;
+
+/// A generous PDU size for internal use.
+/// Prefer to initialize buffers no larger than this size
+pub(crate) const LARGE_PDU_SIZE: u32 = 262_144 - PDU_HEADER_SIZE;
 
 #[derive(Debug, Snafu)]
 #[non_exhaustive]
@@ -60,12 +74,23 @@ pub enum WriteError {
         #[snafu(backtrace)]
         source: dicom_encoding::text::EncodeTextError,
     },
+
+    #[snafu(display(
+        "Invalid fixed-size text field `{field}`: {reason} (encoded length {actual_length}, field length {length})"
+    ))]
+    InvalidFixedSizeTextField {
+        field: &'static str,
+        length: usize,
+        actual_length: usize,
+        reason: &'static str,
+        backtrace: Backtrace,
+    },
 }
 
 #[derive(Debug, Snafu)]
 #[non_exhaustive]
 pub enum ReadError {
-    #[snafu(display("Invalid max PDU length {}", max_pdu_length))]
+    #[snafu(display("Max PDU length {max_pdu_length} is not acceptable"))]
     InvalidMaxPdu {
         max_pdu_length: u32,
         backtrace: Backtrace,
@@ -95,6 +120,14 @@ pub enum ReadError {
 
     #[snafu(display("Invalid item length {} (must be >=2)", length))]
     InvalidItemLength { length: u32 },
+
+    #[snafu(display(
+        "SOP Class Extended Negotiation item length {length} is too short (should be >= 2 + SOP Class UID length {sop_class_uid_length})"
+    ))]
+    ShortSopClassExtendedNegotiationItemLength {
+        length: u32,
+        sop_class_uid_length: u16,
+    },
 
     #[snafu(display("Could not read {} reserved bytes", bytes))]
     ReadReserved {
@@ -142,6 +175,10 @@ pub enum ReadError {
     MissingAbstractSyntax { backtrace: Backtrace },
     #[snafu(display("Missing transfer syntax"))]
     MissingTransferSyntax { backtrace: Backtrace },
+    #[snafu(display("Invalid PDU field length"))]
+    InvalidPduFieldLength { backtrace: Backtrace },
+    #[snafu(display("Could not read user variable"))]
+    ReadUserVariable { backtrace: Backtrace },
 }
 
 /// Message component for a proposed presentation context.
@@ -156,11 +193,22 @@ pub struct PresentationContextProposed {
     pub transfer_syntaxes: Vec<String>,
 }
 
+/// Message component for the result of the presentation context negotiation.
 #[derive(Clone, Eq, PartialEq, PartialOrd, Hash, Debug)]
 pub struct PresentationContextResult {
     pub id: u8,
     pub reason: PresentationContextResultReason,
     pub transfer_syntax: String,
+}
+
+/// Result of the presentation context negotiation, including the
+/// abstract syntax that corresponds to each presentation context.
+#[derive(Clone, Eq, PartialEq, PartialOrd, Hash, Debug)]
+pub struct PresentationContextNegotiated {
+    pub id: u8,
+    pub reason: PresentationContextResultReason,
+    pub transfer_syntax: String,
+    pub abstract_syntax: String,
 }
 
 #[derive(Clone, Eq, PartialEq, PartialOrd, Hash, Debug)]
@@ -455,6 +503,14 @@ pub enum PduVariableItem {
     UserVariables(Vec<UserVariableItem>),
 }
 
+/// Roles that the association requestor can adopt for a
+/// particular SOP class.
+#[derive(Debug, Copy, Clone, PartialEq, Eq, Hash, PartialOrd)]
+pub struct RequestorRoles {
+    pub scu: bool,
+    pub scp: bool,
+}
+
 #[derive(Clone, Eq, PartialEq, PartialOrd, Hash, Debug)]
 pub enum UserVariableItem {
     Unknown(u8, Vec<u8>),
@@ -462,6 +518,7 @@ pub enum UserVariableItem {
     ImplementationClassUID(String),
     ImplementationVersionName(String),
     SopClassExtendedNegotiationSubItem(String, Vec<u8>),
+    ScuScpRoleSelectionSubItem(String, RequestorRoles),
     UserIdentityItem(UserIdentity),
 }
 
@@ -472,6 +529,7 @@ pub struct UserIdentity {
     primary_field: Vec<u8>,
     secondary_field: Vec<u8>,
 }
+
 impl UserIdentity {
     pub fn new(
         positive_response_requested: bool,
@@ -513,6 +571,7 @@ pub enum UserIdentityType {
     SamlAssertion,
     Jwt,
 }
+
 impl UserIdentityType {
     fn from(user_identity_type: u8) -> Option<Self> {
         match user_identity_type {

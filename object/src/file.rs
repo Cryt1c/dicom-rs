@@ -3,8 +3,9 @@ use dicom_dictionary_std::StandardDataDictionary;
 use dicom_encoding::transfer_syntax::TransferSyntaxIndex;
 use dicom_transfer_syntax_registry::TransferSyntaxRegistry;
 
-// re-export from dicom_parser
+// re-export public options from dicom_parser
 pub use dicom_parser::dataset::read::OddLengthStrategy;
+pub use dicom_parser::stateful::decode::CharacterSetOverride;
 
 use crate::{DefaultDicomObject, ReadError};
 use std::io::Read;
@@ -60,8 +61,10 @@ pub struct OpenFileOptions<D = StandardDataDictionary, T = TransferSyntaxRegistr
     data_dictionary: D,
     ts_index: T,
     read_until: Option<Tag>,
+    read_to: Option<Tag>,
     read_preamble: ReadPreamble,
     odd_length: OddLengthStrategy,
+    charset_override: CharacterSetOverride,
 }
 
 impl OpenFileOptions {
@@ -77,8 +80,24 @@ impl<D, T> OpenFileOptions<D, T> {
     /// or any other tag that is next in the standard DICOM tag ordering,
     /// is found in the object's root data set.
     /// An element with the exact tag will be excluded from the output.
+    ///
+    /// If both `read_until` and [`read_to`](Self::read_to) are set to the same tag,
+    /// `read_until` takes priority and the tag is excluded.
     pub fn read_until(mut self, tag: Tag) -> Self {
         self.read_until = Some(tag);
+        self
+    }
+
+    /// Set the operation to read up to and including the given tag.
+    ///
+    /// The reading process ends right after the element with this tag
+    /// is read into the object's root data set.
+    /// An element with the exact tag will be included in the output.
+    ///
+    /// If both [`read_until`](Self::read_until) and `read_to` are set to the same tag,
+    /// `read_until` takes priority and the tag is excluded.
+    pub fn read_to(mut self, tag: Tag) -> Self {
+        self.read_to = Some(tag);
         self
     }
 
@@ -87,6 +106,7 @@ impl<D, T> OpenFileOptions<D, T> {
     /// This is the default behavior.
     pub fn read_all(mut self) -> Self {
         self.read_until = None;
+        self.read_to = None;
         self
     }
 
@@ -102,6 +122,12 @@ impl<D, T> OpenFileOptions<D, T> {
         self
     }
 
+    /// Set an override on how text values are decoded.
+    pub fn charset_override(mut self, option: CharacterSetOverride) -> Self {
+        self.charset_override = option;
+        self
+    }
+
     /// Set the transfer syntax index to use when reading the file.
     pub fn transfer_syntax_index<Tr>(self, ts_index: Tr) -> OpenFileOptions<D, Tr>
     where
@@ -110,14 +136,16 @@ impl<D, T> OpenFileOptions<D, T> {
         OpenFileOptions {
             data_dictionary: self.data_dictionary,
             read_until: self.read_until,
+            read_to: self.read_to,
             read_preamble: self.read_preamble,
             ts_index,
             odd_length: self.odd_length,
+            charset_override: self.charset_override,
         }
     }
 
     /// Set the transfer syntax index to use when reading the file.
-    #[deprecated(since="0.8.1", note="please use `transfer_syntax_index` instead")]
+    #[deprecated(since = "0.8.1", note = "please use `transfer_syntax_index` instead")]
     pub fn tranfer_syntax_index<Tr>(self, ts_index: Tr) -> OpenFileOptions<D, Tr>
     where
         Tr: TransferSyntaxIndex,
@@ -134,9 +162,11 @@ impl<D, T> OpenFileOptions<D, T> {
         OpenFileOptions {
             data_dictionary: dict,
             read_until: self.read_until,
+            read_to: self.read_to,
             read_preamble: self.read_preamble,
             ts_index: self.ts_index,
             odd_length: self.odd_length,
+            charset_override: self.charset_override,
         }
     }
 
@@ -153,8 +183,10 @@ impl<D, T> OpenFileOptions<D, T> {
             self.data_dictionary,
             self.ts_index,
             self.read_until,
+            self.read_to,
             self.read_preamble,
             self.odd_length,
+            self.charset_override,
         )
     }
 
@@ -175,8 +207,10 @@ impl<D, T> OpenFileOptions<D, T> {
             self.data_dictionary,
             self.ts_index,
             self.read_until,
+            self.read_to,
             self.read_preamble,
             self.odd_length,
+            self.charset_override,
         )
     }
 }

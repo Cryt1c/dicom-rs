@@ -186,6 +186,7 @@
 //! # run().unwrap();
 //! ```
 pub mod collector;
+pub mod dicomdir;
 pub mod file;
 pub mod mem;
 pub mod meta;
@@ -193,6 +194,9 @@ pub mod ops;
 pub mod tokens;
 
 pub use crate::collector::{DicomCollector, DicomCollectorOptions};
+pub use crate::dicomdir::{
+    DicomDir, DicomDirError, DirectoryRecord, DirectoryRecordType, ReferencedFile,
+};
 pub use crate::file::{OpenFileOptions, from_reader, open_file};
 pub use crate::mem::InMemDicomObject;
 pub use crate::meta::{FileMetaTable, FileMetaTableBuilder};

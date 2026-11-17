@@ -1233,9 +1233,11 @@ mod tests {
             NaiveTime::from_hms_micro_opt(9, 1, 1, /* 00 */ 2999).unwrap()
         );
 
-        assert!(DicomTime::from_hms_micro(9, 1, 1, 123456)
-            .unwrap()
-            .is_precise());
+        assert!(
+            DicomTime::from_hms_micro(9, 1, 1, 123456)
+                .unwrap()
+                .is_precise()
+        );
 
         assert_eq!(
             DicomTime::from_hms_milli(9, 1, 1, 1).unwrap(),
@@ -1677,12 +1679,14 @@ mod tests {
         ));
 
         // simple precision checks
-        assert!(!DicomDateTime::from_date_and_time(
-            DicomDate::from_ymd(2000, 1, 1).unwrap(),
-            DicomTime::from_hms_milli(23, 59, 59, 10).unwrap()
-        )
-        .unwrap()
-        .is_precise());
+        assert!(
+            !DicomDateTime::from_date_and_time(
+                DicomDate::from_ymd(2000, 1, 1).unwrap(),
+                DicomTime::from_hms_milli(23, 59, 59, 10).unwrap()
+            )
+            .unwrap()
+            .is_precise()
+        );
 
         assert!(
             DicomDateTime::from_date_and_time(

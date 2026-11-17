@@ -2233,7 +2233,6 @@ where
                 }
                 token => return UnexpectedTokenSnafu { token }.fail(),
             };
-
             entries.insert(elem.tag(), elem);
         }
 
